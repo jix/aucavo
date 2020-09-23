@@ -4,9 +4,12 @@ use crate::TmpVec;
 use num_traits::{AsPrimitive, PrimInt, Unsigned};
 use smallvec::{Array, SmallVec};
 use std::{
+    borrow::Cow,
     fmt::{Debug, Display},
     hash::Hash,
     ptr::copy_nonoverlapping,
+    rc::Rc,
+    sync::Arc,
 };
 
 /// Set of values on which a permutation acts.
@@ -62,7 +65,7 @@ implement_point_trait!(u32);
 ///
 /// This truncated arrangement is stored in a value of type parameter `S` implementing the
 /// [`PermStorage`] trait. This includes [`Point`] slices and [`Vec`]s, as well as references,
-/// [`Box`]es, [`Rc`][std::rc::Rc]s, [`Arc`][std::sync::Arc]s, [`Cow`][std::borrow::Cow]s containing
+/// [`Box`]es, [`Rc`]s, [`Arc`]s, [`Cow`]s containing
 /// those.
 ///
 /// The corresponding type of [`Point`]s of a `Perm<S>` can be accessed as the associated type
@@ -424,7 +427,7 @@ where
     }
 }
 
-unsafe impl<P, S> PermStorage for std::rc::Rc<S>
+unsafe impl<P, S> PermStorage for Rc<S>
 where
     P: Point,
     S: PermStorage<Point = P> + ?Sized,
@@ -436,7 +439,7 @@ where
     }
 }
 
-unsafe impl<P, S> PermStorage for std::sync::Arc<S>
+unsafe impl<P, S> PermStorage for Arc<S>
 where
     P: Point,
     S: PermStorage<Point = P> + ?Sized,
@@ -448,7 +451,7 @@ where
     }
 }
 
-unsafe impl<'a, P: Point> PermStorage for std::borrow::Cow<'a, [P]> {
+unsafe impl<'a, P: Point> PermStorage for Cow<'a, [P]> {
     type Point = P;
 
     fn stored_tarr(&self) -> &[Self::Point] {
@@ -487,16 +490,16 @@ pub unsafe trait PermExpr: Sized {
     /// arrangement, which must be less than or equal to the buffer size it requested using
     /// `reserve`.
     ///
-    /// If `write_tarr_to_buffer` returns 0, it is allowed (but not required) for this method to not
-    /// call `reserve`.
+    /// The reserve method must be called in any case, even if the requested size is zero. In that
+    /// case reserve is allowed to return a null pointer.
     ///
     /// # Safety
     ///
     /// A caller of this method must ensure that the passed `reserve` value returns a buffer of the
     /// correct size or panics.
     ///
-    /// An implementing type must ensure to initialize the buffer with a valid truncated arrangement
-    /// of the size it returns.
+    /// An implementing type must initialize the buffer with a valid truncated arrangement of the
+    /// size it returns.
     unsafe fn write_tarr_to_buffer(self, reserve: impl FnOnce(usize) -> *mut Self::Point) -> usize;
 
     /// Obtain the represented permutation as a [`Perm`].
@@ -505,6 +508,21 @@ pub unsafe trait PermExpr: Sized {
     #[inline(always)]
     fn to_perm<St: PermStorageNew<Point = Self::Point>>(self) -> Perm<St> {
         Perm::new(self)
+    }
+
+    /// Product of two permutations.
+    ///
+    /// The return type implements [`PermExpr`].
+    ///
+    /// Following the convention of computational group theory, the product of two permutations is
+    /// the permutation that results by applying the the permutation on the left followed by the
+    /// permutation on the right. Many other areas of mathematics have the reverse of this as
+    /// convention.
+    fn product<T>(self, other: T) -> Product<Self, T>
+    where
+        T: PermExpr<Point = Self::Point>,
+    {
+        Product(self, other)
     }
 }
 
@@ -519,24 +537,64 @@ pub unsafe trait PermExpr: Sized {
 /// Any implementing type must guarantee that [`PermStorage::stored_tarr`] always returns the
 /// currently stored truncated arrangement and respects any modification done via the methods of
 /// this trait.
-pub unsafe trait PermStorageMut: PermStorage {
+pub unsafe trait PermStorageMut: PermStorage + Clone {
     /// Set the stored permutation.
     ///
     /// This overwrites the currently stored permutation.
     fn assign(&mut self, expr: impl PermExpr<Point = Self::Point>);
 }
 
-unsafe impl<Pt: Point> PermStorageMut for Vec<Pt> {
-    fn assign(&mut self, expr: impl PermExpr<Point = Self::Point>) {
-        unsafe {
-            let length = expr.write_tarr_to_buffer(|capacity| {
-                self.clear();
-                self.reserve(capacity);
-                self.as_mut_ptr()
-            });
-            debug_assert!(length <= self.capacity());
-            self.set_len(length);
+macro_rules! vec_like_perm_storage_mut_impl {
+    () => {
+        fn assign(&mut self, expr: impl PermExpr<Point = Self::Point>) {
+            unsafe {
+                #[cfg(debug_assertions)]
+                let mut reserve_called = false;
+                let length = expr.write_tarr_to_buffer(|capacity| {
+                    #[cfg(debug_assertions)]
+                    {
+                        reserve_called = true;
+                    }
+                    self.clear();
+                    self.reserve(capacity);
+                    self.as_mut_ptr()
+                });
+                #[cfg(debug_assertions)]
+                debug_assert!(reserve_called);
+                debug_assert!(length <= self.capacity());
+                self.set_len(length);
+            }
         }
+    };
+}
+
+unsafe impl<Pt: Point> PermStorageMut for Vec<Pt> {
+    vec_like_perm_storage_mut_impl!();
+}
+
+unsafe impl<P, A> PermStorageMut for SmallVec<A>
+where
+    P: Point,
+    A: Array<Item = P>,
+{
+    vec_like_perm_storage_mut_impl!();
+}
+
+unsafe impl<S: PermStorageMut> PermStorageMut for Rc<S> {
+    fn assign(&mut self, expr: impl PermExpr<Point = Self::Point>) {
+        Rc::make_mut(self).assign(expr);
+    }
+}
+
+unsafe impl<S: PermStorageMut> PermStorageMut for Arc<S> {
+    fn assign(&mut self, expr: impl PermExpr<Point = Self::Point>) {
+        Arc::make_mut(self).assign(expr);
+    }
+}
+
+unsafe impl<'a, P: Point> PermStorageMut for Cow<'a, [P]> {
+    fn assign(&mut self, expr: impl PermExpr<Point = Self::Point>) {
+        self.to_mut().assign(expr);
     }
 }
 
@@ -560,6 +618,73 @@ pub unsafe trait PermStorageNew: PermStorageMut + Default {
 
 unsafe impl<P: Point> PermStorageNew for Vec<P> {}
 
+unsafe impl<P, A> PermStorageNew for SmallVec<A>
+where
+    P: Point,
+    A: Array<Item = P>,
+{
+}
+
+unsafe impl<S: PermStorageNew> PermStorageNew for Rc<S> {}
+unsafe impl<S: PermStorageNew> PermStorageNew for Arc<S> {}
+unsafe impl<'a, P: Point> PermStorageNew for Cow<'a, [P]> {}
+
+/// Product of two permutations.
+///
+/// This type stores a left and a right subexpression and implements [`PermExpr`] if it is
+/// implemented by both subexpressions.
+///
+/// Following the convention of computational group theory, the product of two permutations is the
+/// permutation that results by applying the the permutation on the left followed by the permutation
+/// on the right. Many other areas of mathematics have the reverse of this as convention.
+pub struct Product<L, R>(pub L, pub R);
+
+unsafe impl<L, R> PermExpr for Product<L, R>
+where
+    L: PermExpr,
+    R: PermExpr<Point = L::Point>,
+{
+    type Point = L::Point;
+
+    unsafe fn write_tarr_to_buffer(self, reserve: impl FnOnce(usize) -> *mut Self::Point) -> usize {
+        // TODO optimize and add specialization via const-prop-time dynamic dispatch
+        // For now this is a naive implementation which always performs unnecessary copies
+        let tmp_l: Perm<TmpVec<_>> = self.0.to_perm();
+        let tmp_r: Perm<TmpVec<_>> = self.1.to_perm();
+        let tarr_l = tmp_l.tarr();
+        let tarr_r = tmp_r.tarr();
+
+        let reserve_size = tarr_l.len().max(tarr_r.len());
+
+        let buffer = reserve(reserve_size);
+
+        // We first iterate over the points 0..tarr_l and apply tarr_r.
+        for (i, j) in tarr_l.iter().enumerate() {
+            // This is a (hopefully) branch free way of reading tarr_r[j] if in bounds and j if out
+            // of bounds.
+            let point = tarr_r.get(j.as_()).unwrap_or(j);
+            // SAFETY: buffer has a size of reserve_size which is >= tarr_l.len()
+            buffer.add(i).write(*point);
+        }
+        for (i, j) in tarr_r.iter().enumerate().skip(tarr_l.len()) {
+            // SAFETY: buffer has a size of reserve_size which is >= tarr_r.len()
+            buffer.add(i).write(*j);
+        }
+
+        // at this point 0..reserve_size is initialized.
+
+        let mut tarr_len = reserve_size;
+        // SAFETY: As tarr_len starts with the size of buffer and is always kept positive,
+        // `tarr_len - 1` is a valid offset to read from
+        while tarr_len > 0 && buffer.add(tarr_len - 1).read().as_() == tarr_len - 1 {
+            tarr_len -= 1;
+        }
+
+        // SAFETY: tarr_len <= reserve_size and we initialized all 0..reserve_size items
+        tarr_len
+    }
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -574,5 +699,37 @@ mod tests {
         let x: Perm<Vec<u32>> = Perm::identity();
         assert_eq!(format!("{}", x), "()");
         assert_eq!(format!("{:?}", x), "perm![]");
+    }
+
+    #[test]
+    fn perm_product() {
+        let x: Perm<Vec<u32>> = Perm::from_tarr(vec![1, 2, 3, 0]).unwrap();
+        let y: Perm<Vec<u32>> = Perm::from_tarr(vec![1, 2, 3, 4, 5, 6, 0]).unwrap();
+
+        let xx: Perm<Vec<u32>> = (&x).product(&x).to_perm();
+        assert_eq!(xx, Perm::from_tarr(vec![2, 3, 0, 1]).unwrap());
+
+        let xy: Perm<Vec<u32>> = (&x).product(&y).to_perm();
+        assert_eq!(xy, Perm::from_tarr(vec![2, 3, 4, 1, 5, 6, 0]).unwrap());
+
+        let yx: Perm<Vec<u32>> = (&y).product(&x).to_perm();
+        assert_eq!(yx, Perm::from_tarr(vec![2, 3, 0, 4, 5, 6, 1]).unwrap());
+
+        let yy: Perm<Vec<u32>> = (&y).product(&y).to_perm();
+        assert_eq!(yy, Perm::from_tarr(vec![2, 3, 4, 5, 6, 0, 1]).unwrap());
+
+        let y4: Perm<Vec<u32>> = (&yy).product(&yy).to_perm();
+        assert_eq!(y4, Perm::from_tarr(vec![4, 5, 6, 0, 1, 2, 3]).unwrap());
+
+        let y6: Perm<Vec<u32>> = (&y4).product(&yy).to_perm();
+        assert_eq!(y6, Perm::from_tarr(vec![6, 0, 1, 2, 3, 4, 5]).unwrap());
+
+        let y7: Perm<Vec<u32>> = (&y6).product(&y).to_perm();
+        assert!(y7.is_identity());
+
+        let z: Perm<Vec<u32>> = Perm::from_tarr(vec![6, 0, 1, 3, 2, 4, 5]).unwrap();
+
+        let yz: Perm<Vec<u32>> = (&y).product(&z).to_perm();
+        assert_eq!(yz, Perm::from_tarr(vec![0, 1, 3, 2]).unwrap());
     }
 }
