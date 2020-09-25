@@ -148,7 +148,7 @@ impl<S: PermStorage + ?Sized> Perm<S> {
     }
 }
 
-impl<S: PermStorageNew> Perm<S> {
+impl<S: PermStorageMut> Perm<S> {
     /// Create a new value storing a given permutation.
     #[inline(always)]
     pub fn new(expr: impl PermExpr<Point = S::Point>) -> Perm<S> {
@@ -183,7 +183,7 @@ impl<S: PermStorage + ?Sized> AsRef<Perm<[S::Point]>> for Perm<S> {
     }
 }
 
-impl<S: PermStorageNew> Default for Perm<S> {
+impl<S: PermStorageMut> Default for Perm<S> {
     fn default() -> Self {
         Perm(S::default())
     }
@@ -481,8 +481,8 @@ pub unsafe trait PermExpr: Sized {
 
     /// Writes the truncated permutation to a buffer.
     ///
-    /// *Note:* Unless you wish to implement this trait, [`PermStorageNew`] or [`PermStorageMut`]
-    /// for a custom type, you will not need to use this method directly.
+    /// *Note:* Unless you wish to implement this trait or [`PermStorageMut`] for a custom type, you
+    /// will not need to use this method directly.
     ///
     /// The method is passed a `reserve` function which, given a size, must return a raw pointer to
     /// an uninitialized buffer of at least that size. Then this method writes the truncated
@@ -506,7 +506,7 @@ pub unsafe trait PermExpr: Sized {
     ///
     /// This is implemented by passing `self` to [`Perm::new`].
     #[inline(always)]
-    fn to_perm<St: PermStorageNew<Point = Self::Point>>(self) -> Perm<St> {
+    fn to_perm<St: PermStorageMut<Point = Self::Point>>(self) -> Perm<St> {
         Perm::new(self)
     }
 
@@ -537,11 +537,18 @@ pub unsafe trait PermExpr: Sized {
 /// Any implementing type must guarantee that [`PermStorage::stored_tarr`] always returns the
 /// currently stored truncated arrangement and respects any modification done via the methods of
 /// this trait.
-pub unsafe trait PermStorageMut: PermStorage + Clone {
+pub unsafe trait PermStorageMut: PermStorage + Clone + Default {
     /// Set the stored permutation.
     ///
     /// This overwrites the currently stored permutation.
     fn assign(&mut self, expr: impl PermExpr<Point = Self::Point>);
+
+    /// Create a new value storing a truncated arrangement specified by a [`PermExpr`].
+    fn from_expr(expr: impl PermExpr<Point = Self::Point>) -> Self {
+        let mut result = Self::default();
+        result.assign(expr);
+        result
+    }
 }
 
 macro_rules! vec_like_perm_storage_mut_impl {
@@ -597,37 +604,6 @@ unsafe impl<'a, P: Point> PermStorageMut for Cow<'a, [P]> {
         self.to_mut().assign(expr);
     }
 }
-
-/// Types that can be used as storage for new [`Perm`] values.
-///
-/// This is a subset of the types implementing [`PermStorageMut`], as this comes with the additional
-/// requirement of implementing `Default`.
-///
-/// # Safety
-///
-/// Any implementing type must guarantee that [`PermStorage::stored_tarr`] initially returns the
-/// truncated assignment specified when creating values via this trait.
-pub unsafe trait PermStorageNew: PermStorageMut + Default {
-    /// Create a new value storing a given truncated arrangement.
-    fn from_expr(expr: impl PermExpr<Point = Self::Point>) -> Self {
-        let mut result = Self::default();
-        result.assign(expr);
-        result
-    }
-}
-
-unsafe impl<P: Point> PermStorageNew for Vec<P> {}
-
-unsafe impl<P, A> PermStorageNew for SmallVec<A>
-where
-    P: Point,
-    A: Array<Item = P>,
-{
-}
-
-unsafe impl<S: PermStorageNew> PermStorageNew for Rc<S> {}
-unsafe impl<S: PermStorageNew> PermStorageNew for Arc<S> {}
-unsafe impl<'a, P: Point> PermStorageNew for Cow<'a, [P]> {}
 
 /// Product of two permutations.
 ///
