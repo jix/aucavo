@@ -148,7 +148,7 @@ impl<S: PermStorage + ?Sized> Perm<S> {
     }
 }
 
-impl<S: PermStorageMut> Perm<S> {
+impl<S: PermStorageMut + Default> Perm<S> {
     /// Create a new value storing a given permutation.
     #[inline(always)]
     pub fn new(expr: impl PermExpr<Point = S::Point>) -> Perm<S> {
@@ -169,9 +169,25 @@ impl<'a, S: ?Sized> From<Perm<&'a S>> for &'a Perm<S> {
     }
 }
 
+impl<'a, S: ?Sized> From<Perm<&'a mut S>> for &'a mut Perm<S> {
+    #[inline(always)]
+    fn from(perm: Perm<&mut S>) -> Self {
+        // SAFETY: This is a safe cast as Perm is repr(transparent)
+        unsafe { &mut *(perm.0 as *mut S as *mut Perm<S>) }
+    }
+}
+
 impl<'a, S: ?Sized> From<&'a Perm<S>> for Perm<&'a S> {
+    #[inline(always)]
     fn from(perm: &'a Perm<S>) -> Self {
         Perm(&perm.0)
+    }
+}
+
+impl<'a, S: ?Sized> From<&'a mut Perm<S>> for Perm<&'a mut S> {
+    #[inline(always)]
+    fn from(perm: &'a mut Perm<S>) -> Self {
+        Perm(&mut perm.0)
     }
 }
 
@@ -183,7 +199,7 @@ impl<S: PermStorage + ?Sized> AsRef<Perm<[S::Point]>> for Perm<S> {
     }
 }
 
-impl<S: PermStorageMut> Default for Perm<S> {
+impl<S: PermStorageMut + Default> Default for Perm<S> {
     fn default() -> Self {
         Perm(S::default())
     }
@@ -317,19 +333,17 @@ unsafe impl<S: PermStorage> PermExpr for Perm<S> {
     type Point = S::Point;
 
     #[inline(always)]
-    unsafe fn write_tarr_to_buffer(self, reserve: impl FnOnce(usize) -> *mut Self::Point) -> usize {
-        self.as_ref().write_tarr_to_buffer(reserve)
+    fn assign_to_perm_storage<St: PermStorageMut<Point = Self::Point>>(self, target: &mut St) {
+        target.set_stored_tarr_from_tarr_slice(self.tarr());
     }
 }
 
 unsafe impl<S: PermStorage + ?Sized> PermExpr for &Perm<S> {
     type Point = S::Point;
 
-    unsafe fn write_tarr_to_buffer(self, reserve: impl FnOnce(usize) -> *mut Self::Point) -> usize {
-        let tarr = self.0.stored_tarr();
-        let dst = reserve(tarr.len());
-        copy_nonoverlapping(tarr.as_ptr(), dst, tarr.len());
-        tarr.len()
+    #[inline(always)]
+    fn assign_to_perm_storage<St: PermStorageMut<Point = Self::Point>>(self, target: &mut St) {
+        target.set_stored_tarr_from_tarr_slice(self.tarr());
     }
 }
 
@@ -479,34 +493,18 @@ pub unsafe trait PermExpr: Sized {
     /// The type of points of the represented permutation.
     type Point: Point;
 
-    /// Writes the truncated permutation to a buffer.
-    ///
-    /// *Note:* Unless you wish to implement this trait or [`PermStorageMut`] for a custom type, you
-    /// will not need to use this method directly.
-    ///
-    /// The method is passed a `reserve` function which, given a size, must return a raw pointer to
-    /// an uninitialized buffer of at least that size. Then this method writes the truncated
-    /// arrangement into that buffer. Finally it returns the actual size of the truncated
-    /// arrangement, which must be less than or equal to the buffer size it requested using
-    /// `reserve`.
-    ///
-    /// The reserve method must be called in any case, even if the requested size is zero. In that
-    /// case reserve is allowed to return a null pointer.
+    /// Overwrite the passed reference's value with this permutation's truncated arrangement.
     ///
     /// # Safety
     ///
-    /// A caller of this method must ensure that the passed `reserve` value returns a buffer of the
-    /// correct size or panics.
-    ///
-    /// An implementing type must initialize the buffer with a valid truncated arrangement of the
-    /// size it returns.
-    unsafe fn write_tarr_to_buffer(self, reserve: impl FnOnce(usize) -> *mut Self::Point) -> usize;
+    /// Implementors need to ensure that `target` is in a valid state even if a panic occurs.
+    fn assign_to_perm_storage<S: PermStorageMut<Point = Self::Point>>(self, target: &mut S);
 
-    /// Obtain the represented permutation as a [`Perm`].
+    /// Obtain this permutation as a [`Perm`].
     ///
     /// This is implemented by passing `self` to [`Perm::new`].
     #[inline(always)]
-    fn to_perm<St: PermStorageMut<Point = Self::Point>>(self) -> Perm<St> {
+    fn to_perm<S: PermStorageMut<Point = Self::Point> + Default>(self) -> Perm<S> {
         Perm::new(self)
     }
 
@@ -537,45 +535,154 @@ pub unsafe trait PermExpr: Sized {
 /// Any implementing type must guarantee that [`PermStorage::stored_tarr`] always returns the
 /// currently stored truncated arrangement and respects any modification done via the methods of
 /// this trait.
-pub unsafe trait PermStorageMut: PermStorage + Clone + Default {
+pub unsafe trait PermStorageMut: PermStorage + Sized {
     /// Set the stored permutation.
     ///
     /// This overwrites the currently stored permutation.
-    fn assign(&mut self, expr: impl PermExpr<Point = Self::Point>);
+    fn assign(&mut self, expr: impl PermExpr<Point = Self::Point>) {
+        expr.assign_to_perm_storage(self)
+    }
 
     /// Create a new value storing a truncated arrangement specified by a [`PermExpr`].
-    fn from_expr(expr: impl PermExpr<Point = Self::Point>) -> Self {
+    fn from_expr(expr: impl PermExpr<Point = Self::Point>) -> Self
+    where
+        Self: Default,
+    {
         let mut result = Self::default();
         result.assign(expr);
         result
+    }
+
+    /// The capacity of the buffer storing the truncated arrangement.
+    fn stored_tarr_capacity(&self) -> usize;
+
+    /// Raw mutable pointer to the start of the buffer storing the truncated arrangement.
+    fn stored_tarr_mut_ptr(&mut self) -> *mut Self::Point;
+
+    /// Resize the buffer storing the truncated arrangement to have at least a given capacity.
+    ///
+    /// # Safety
+    ///
+    /// This invalidates any values stored in the excess capacity of the buffer (values past the
+    /// currently stored truncated arrangement).
+    fn ensure_stored_tarr_capacity(&mut self, cap: usize);
+
+    /// Set the length of the stored truncated arrangement.
+    ///
+    /// # Safety
+    ///
+    /// This given length must be at or below the capacity of the buffer storing the truncated
+    /// arrangement. The first `len` items of the buffer must be initialized.
+    ///
+    /// Calling this with a `len` of zero must be safe. Users of this trait, though, should prefer
+    /// calling [`clear_stored_tarr`][Self::clear_stored_tarr] over setting the length to zero if
+    /// possible.
+    unsafe fn set_stored_tarr_len(&mut self, len: usize);
+
+    /// Clear the stored truncated arrangement.
+    ///
+    /// # Safety
+    ///
+    /// This invalidates the whole buffer storing the truncated arrangement. It may also change the
+    /// capacity of the buffer (this is useful for copy-on-write implementations).
+    fn clear_stored_tarr(&mut self) {
+        unsafe { self.set_stored_tarr_len(0) }
+    }
+
+    /// Prepare overwriting the stored truncated arrangement.
+    ///
+    /// This clears the stored truncated arrangement, then ensure that its buffer has at least the
+    /// given capacity and finally returns a raw mutable pointer to the buffer.
+    ///
+    /// It is equivalent to calling [`clear_stored_tarr`][Self::clear_stored_tarr],
+    /// [`ensure_stored_tarr_capacity`][Self::ensure_stored_tarr_capacity] and
+    /// [`stored_tarr_mut_ptr`][Self::stored_tarr_mut_ptr] in sequence, but implementing types can
+    /// optimize this sequence.
+    fn overwrite_stored_tarr(&mut self, cap: usize) -> *mut Self::Point {
+        self.clear_stored_tarr();
+        self.ensure_stored_tarr_capacity(cap);
+        self.stored_tarr_mut_ptr()
+    }
+
+    /// Assign the stored truncated arrangement from a slice.
+    fn set_stored_tarr_from_tarr_slice(&mut self, slice: &[Self::Point]) {
+        let buffer = self.overwrite_stored_tarr(slice.len());
+        // SAFETY: overwrite_stored_tarr ensures a buffer of at least the given capacity
+        unsafe {
+            copy_nonoverlapping(slice.as_ptr(), buffer, slice.len());
+            // SAFETY: we just initialized this number of elements
+            self.set_stored_tarr_len(slice.len());
+        }
+    }
+}
+
+unsafe impl<'a, S: PermStorageMut> PermStorageMut for &'a mut S {
+    fn stored_tarr_capacity(&self) -> usize {
+        (**self).stored_tarr_capacity()
+    }
+
+    fn stored_tarr_mut_ptr(&mut self) -> *mut Self::Point {
+        (**self).stored_tarr_mut_ptr()
+    }
+
+    fn ensure_stored_tarr_capacity(&mut self, cap: usize) {
+        (**self).ensure_stored_tarr_capacity(cap)
+    }
+
+    unsafe fn set_stored_tarr_len(&mut self, len: usize) {
+        (**self).set_stored_tarr_len(len)
+    }
+
+    fn assign(&mut self, expr: impl PermExpr<Point = Self::Point>) {
+        (**self).assign(expr)
+    }
+
+    fn clear_stored_tarr(&mut self) {
+        (**self).clear_stored_tarr()
+    }
+
+    fn overwrite_stored_tarr(&mut self, cap: usize) -> *mut Self::Point {
+        (**self).overwrite_stored_tarr(cap)
+    }
+
+    fn set_stored_tarr_from_tarr_slice(&mut self, slice: &[Self::Point]) {
+        (**self).set_stored_tarr_from_tarr_slice(slice)
     }
 }
 
 macro_rules! vec_like_perm_storage_mut_impl {
     () => {
-        fn assign(&mut self, expr: impl PermExpr<Point = Self::Point>) {
-            unsafe {
-                #[cfg(debug_assertions)]
-                let mut reserve_called = false;
-                let length = expr.write_tarr_to_buffer(|capacity| {
-                    #[cfg(debug_assertions)]
-                    {
-                        reserve_called = true;
-                    }
-                    self.clear();
-                    self.reserve(capacity);
-                    self.as_mut_ptr()
-                });
-                #[cfg(debug_assertions)]
-                debug_assert!(reserve_called);
-                debug_assert!(length <= self.capacity());
-                self.set_len(length);
+        fn stored_tarr_capacity(&self) -> usize {
+            self.capacity()
+        }
+
+        fn stored_tarr_mut_ptr(&mut self) -> *mut Self::Point {
+            self.as_mut_ptr()
+        }
+
+        fn ensure_stored_tarr_capacity(&mut self, cap: usize) {
+            let len = self.len();
+            if cap > len {
+                self.reserve(cap - len)
             }
+        }
+
+        unsafe fn set_stored_tarr_len(&mut self, len: usize) {
+            self.set_len(len)
+        }
+
+        fn clear_stored_tarr(&mut self) {
+            self.clear();
+        }
+
+        fn set_stored_tarr_from_tarr_slice(&mut self, slice: &[Self::Point]) {
+            self.clear();
+            self.extend_from_slice(slice);
         }
     };
 }
 
-unsafe impl<Pt: Point> PermStorageMut for Vec<Pt> {
+unsafe impl<P: Point> PermStorageMut for Vec<P> {
     vec_like_perm_storage_mut_impl!();
 }
 
@@ -587,21 +694,68 @@ where
     vec_like_perm_storage_mut_impl!();
 }
 
-unsafe impl<S: PermStorageMut> PermStorageMut for Rc<S> {
-    fn assign(&mut self, expr: impl PermExpr<Point = Self::Point>) {
-        Rc::make_mut(self).assign(expr);
-    }
+macro_rules! rc_like_perm_storage_mut_impl {
+    ($rc:ident) => {
+        fn stored_tarr_capacity(&self) -> usize {
+            (**self).stored_tarr_capacity()
+        }
+
+        fn stored_tarr_mut_ptr(&mut self) -> *mut Self::Point {
+            $rc::make_mut(self).stored_tarr_mut_ptr()
+        }
+
+        fn ensure_stored_tarr_capacity(&mut self, cap: usize) {
+            $rc::make_mut(self).ensure_stored_tarr_capacity(cap)
+        }
+
+        unsafe fn set_stored_tarr_len(&mut self, len: usize) {
+            $rc::make_mut(self).set_stored_tarr_len(len)
+        }
+
+        fn clear_stored_tarr(&mut self) {
+            // If this value is shared, avoid making a copy just to clear it
+            if let Some(value) = $rc::get_mut(self) {
+                value.clear_stored_tarr()
+            } else {
+                *self = Default::default()
+            }
+        }
+    };
 }
 
-unsafe impl<S: PermStorageMut> PermStorageMut for Arc<S> {
-    fn assign(&mut self, expr: impl PermExpr<Point = Self::Point>) {
-        Arc::make_mut(self).assign(expr);
-    }
+unsafe impl<S: PermStorageMut + Clone + Default> PermStorageMut for Rc<S> {
+    rc_like_perm_storage_mut_impl!(Rc);
+}
+
+unsafe impl<S: PermStorageMut + Clone + Default> PermStorageMut for Arc<S> {
+    rc_like_perm_storage_mut_impl!(Arc);
 }
 
 unsafe impl<'a, P: Point> PermStorageMut for Cow<'a, [P]> {
-    fn assign(&mut self, expr: impl PermExpr<Point = Self::Point>) {
-        self.to_mut().assign(expr);
+    fn stored_tarr_capacity(&self) -> usize {
+        match self {
+            Cow::Borrowed(slice) => slice.len(),
+            Cow::Owned(vec) => vec.stored_tarr_capacity(),
+        }
+    }
+
+    fn stored_tarr_mut_ptr(&mut self) -> *mut Self::Point {
+        self.to_mut().stored_tarr_mut_ptr()
+    }
+
+    fn ensure_stored_tarr_capacity(&mut self, cap: usize) {
+        self.to_mut().ensure_stored_tarr_capacity(cap)
+    }
+
+    unsafe fn set_stored_tarr_len(&mut self, len: usize) {
+        self.to_mut().set_stored_tarr_len(len)
+    }
+
+    fn clear_stored_tarr(&mut self) {
+        match self {
+            Cow::Borrowed(_) => *self = Cow::Owned(vec![]),
+            Cow::Owned(vec) => vec.clear_stored_tarr(),
+        }
     }
 }
 
@@ -622,7 +776,7 @@ where
 {
     type Point = L::Point;
 
-    unsafe fn write_tarr_to_buffer(self, reserve: impl FnOnce(usize) -> *mut Self::Point) -> usize {
+    fn assign_to_perm_storage<St: PermStorageMut<Point = Self::Point>>(self, target: &mut St) {
         // TODO optimize and add specialization via const-prop-time dynamic dispatch
         // For now this is a naive implementation which always performs unnecessary copies
         let tmp_l: Perm<TmpVec<_>> = self.0.to_perm();
@@ -632,32 +786,35 @@ where
 
         let reserve_size = tarr_l.len().max(tarr_r.len());
 
-        let buffer = reserve(reserve_size);
+        let buffer = target.overwrite_stored_tarr(reserve_size);
 
-        // We first iterate over the points 0..tarr_l and apply tarr_r.
         for (i, j) in tarr_l.iter().enumerate() {
             // This is a (hopefully) branch free way of reading tarr_r[j] if in bounds and j if out
             // of bounds.
             let point = tarr_r.get(j.as_()).unwrap_or(j);
             // SAFETY: buffer has a size of reserve_size which is >= tarr_l.len()
-            buffer.add(i).write(*point);
+            unsafe {
+                buffer.add(i).write(*point);
+            }
         }
         for (i, j) in tarr_r.iter().enumerate().skip(tarr_l.len()) {
             // SAFETY: buffer has a size of reserve_size which is >= tarr_r.len()
-            buffer.add(i).write(*j);
+            unsafe {
+                buffer.add(i).write(*j);
+            }
         }
-
-        // at this point 0..reserve_size is initialized.
 
         let mut tarr_len = reserve_size;
         // SAFETY: As tarr_len starts with the size of buffer and is always kept positive,
         // `tarr_len - 1` is a valid offset to read from
-        while tarr_len > 0 && buffer.add(tarr_len - 1).read().as_() == tarr_len - 1 {
-            tarr_len -= 1;
+        unsafe {
+            while tarr_len > 0 && buffer.add(tarr_len - 1).read().as_() == tarr_len - 1 {
+                tarr_len -= 1;
+            }
         }
 
         // SAFETY: tarr_len <= reserve_size and we initialized all 0..reserve_size items
-        tarr_len
+        unsafe { target.set_stored_tarr_len(tarr_len) }
     }
 }
 
