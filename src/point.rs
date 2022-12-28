@@ -1,3 +1,4 @@
+//! Points in finite structures.
 use std::{fmt, hash::Hash, ops::Range};
 
 pub(crate) mod sealed {

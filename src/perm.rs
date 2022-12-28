@@ -6,7 +6,10 @@ use std::{
 
 use smallvec::{smallvec, SmallVec};
 
-use crate::{inplace::Inplace, point::Point, PointIter, PointRange};
+use crate::{
+    inplace::Inplace,
+    point::{Point, PointIter, PointRange},
+};
 
 /// A permutation.
 #[repr(transparent)]

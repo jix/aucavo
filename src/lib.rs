@@ -7,9 +7,6 @@
 #![warn(clippy::undocumented_unsafe_blocks)]
 #![allow(clippy::comparison_chain)]
 
-mod point;
-
-pub use point::{Point, PointIter, PointRange};
-
 pub mod inplace;
 pub mod perm;
+pub mod point;
