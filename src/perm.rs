@@ -1,15 +1,21 @@
 //! Permutations.
 use std::{
     mem::MaybeUninit,
-    ops::{Deref, Range},
+    ops::{Deref, DerefMut, Range}, fmt,
 };
 
 use smallvec::{smallvec, SmallVec};
 
 use crate::{
-    inplace::Inplace,
+    cycles::CycleDecomposition,
+    inplace::{AssignInplace, Inplace},
     point::{Point, PointIter, PointRange},
 };
+
+use self::iter::{AllArrayPerms, Iter};
+
+pub mod iter;
+pub mod ops;
 
 /// A permutation.
 #[repr(transparent)]
@@ -61,10 +67,10 @@ impl<Pt: Point> Perm<Pt> {
     ///
     /// Panics for non-permutation arguments.
     #[inline]
-    pub fn from_slice_mut(slice: &mut [Pt]) -> &mut Self {
+    pub fn from_mut_slice(slice: &mut [Pt]) -> &mut Self {
         assert!(Self::is_perm(slice));
         // SAFETY: `Self::is_perm` above checks the exact required invariant below
-        unsafe { Self::from_slice_unchecked_mut(slice) }
+        unsafe { Self::from_mut_slice_unchecked(slice) }
     }
 
     /// Creates a `Perm` reference from a slice containing the images of the first n points.
@@ -82,18 +88,18 @@ impl<Pt: Point> Perm<Pt> {
     /// # Safety
     /// The argument `slice` must be a permutation of the points `0..slice.len()`.
     #[inline]
-    pub unsafe fn from_slice_unchecked_mut(slice: &mut [Pt]) -> &mut Self {
+    pub unsafe fn from_mut_slice_unchecked(slice: &mut [Pt]) -> &mut Self {
         // SAFETY: `Self` is a `repr(transparent)` wrapper for `[Pt]`
         unsafe { &mut *(slice as *mut [Pt] as *mut Self) }
     }
 
-    /// Returns the slice containing the images of `self.points()`.
+    /// Returns the slice containing the images of `self.domain()`.
     #[inline]
     pub fn as_slice(&self) -> &[Pt] {
         &self.slice
     }
 
-    /// Returns the mutable slice containing the images of `self.points()`.
+    /// Returns the mutable slice containing the images of `self.domain()`.
     ///
     /// # Safety
     /// A `Perm` must always be a valid permutation and users may depend on this for memory safety.
@@ -104,7 +110,9 @@ impl<Pt: Point> Perm<Pt> {
         &mut self.slice
     }
 
-    /// Returns the size of the set the permutation is defined on.
+    /// Returns the size of the set the permutation acts on.
+    ///
+    /// A `Perm` acts on the set `0..self.degree()`.
     ///
     /// Unless documented otherwise, a smaller degree permutation is implicitly extended by adding
     /// fixed points when a larger degree permutation is expected.
@@ -114,6 +122,9 @@ impl<Pt: Point> Perm<Pt> {
     }
 
     /// Returns the image of a point under the permutation.
+    ///
+    /// When `point` is not in the permutation's domain, this returns `point`, implicitly extending
+    /// the permutation with fixed points.
     #[inline]
     pub fn image(&self, point: Pt) -> Pt {
         self.image_of_index(point.index())
@@ -135,16 +146,63 @@ impl<Pt: Point> Perm<Pt> {
         }
     }
 
-    /// Returns the set on which the permutation is defined on.
+    /// Returns the set the permutation acts on.
     #[inline]
-    pub fn points(&self) -> PointRange<Pt> {
-        PointIter::new(self.indices())
+    pub fn domain(&self) -> PointRange<Pt> {
+        PointIter::new(self.domain_indices())
     }
 
-    /// Returns the indices of the points in the set on which the permutation is defined on.
+    /// Returns the indices of the points in the set the permutation acts on.
+    ///
+    /// See also [`Point::index`].
     #[inline]
-    pub fn indices(&self) -> Range<usize> {
+    pub fn domain_indices(&self) -> Range<usize> {
         0..self.degree()
+    }
+
+    /// Returns the same permutation acting on a set with trailing fixed points removed.
+    #[inline]
+    pub fn as_min_degree(&self) -> &Self {
+        self.shrink_to_degree(0)
+    }
+
+    /// Returns an iterator over all (point, image) pairs of the permutation.
+    #[inline]
+    pub fn iter(&self) -> Iter<Pt> {
+        Iter::new(self)
+    }
+
+    /// Returns the cycle decomposition of this permutation.
+    ///
+    /// The cycle decomposition represents a permutation as a product of disjoint nontrivial cycles.
+    /// As disjoint cycles commute, the order does not matter. To produce a canonical output, this
+    /// method orders the cycles in increasing order of their smallest moved point. Every cycle is
+    /// produced starting with its smallest moved point.
+    ///
+    /// This returns an [`Inplace`] value. To get a value that implements [`IntoIterator`] use
+    /// [`.cycles().build()`][`Inplace::build`] or [`assign`][`AssignInplace::assign`] it to an
+    /// existing value.
+    #[inline]
+    pub fn cycles(&self) -> CycleDecomposition<Pt> {
+        CycleDecomposition::new(self)
+    }
+
+    #[inline]
+    fn shrink_to_degree(&self, degree: usize) -> &Self {
+        let mut shrunk = &self.slice;
+        while shrunk.len() > degree {
+            if let Some((&last, rest)) = shrunk.split_last() {
+                if last.index() != rest.len() {
+                    break;
+                }
+                shrunk = rest;
+            } else {
+                break;
+            }
+        }
+
+        // SAFETY: we only remove fixed points, so shrunk stays a permutation
+        unsafe { Self::from_slice_unchecked(shrunk) }
     }
 
     /// Returns the inverse of this permutation.
@@ -162,6 +220,43 @@ impl<Pt: Point> Perm<Pt> {
     #[inline]
     pub fn prod<'a>(&'a self, other: &'a Perm<Pt>) -> ops::Prod<'a, Pt> {
         ops::Prod::new(self, other)
+    }
+
+    /// Advances to the lexicographically next permutation.
+    ///
+    /// This steps lexicographically through permutations of the same degree. It returns `false` and
+    /// resets to the identity permutation (lexicographically first) when called on the
+    /// lexciographically last permutation.
+    pub fn lexicographical_next(&mut self) -> bool {
+        let mut right_to_left = self.slice.iter().copied().enumerate().rev();
+        let Some((_, mut prev)) = right_to_left.next() else { return false };
+
+        let Some((a, a_image)) = right_to_left.find(|&(_, current)| {
+            let found = current < prev;
+            prev = current;
+            found
+        }) else {
+            self.assign(Self::identity());
+            return false;
+        };
+
+        let b = a + 1 + self.slice[a + 2..].partition_point(|&b_image| b_image > a_image);
+
+        self.slice.swap(a, b);
+        self.slice[a + 1..].reverse();
+        true
+    }
+}
+
+impl<Pt: Point> fmt::Display for Perm<Pt> {
+    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+        fmt::Display::fmt(&self.cycles().build(), f)
+    }
+}
+
+impl<Pt: Point> fmt::Debug for Perm<Pt> {
+    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+        write!(f, "{} @ 0..{}", self, self.degree())
     }
 }
 
@@ -184,8 +279,95 @@ impl<Pt: Point> Deref for VecPerm<Pt> {
     }
 }
 
+impl<Pt: Point> DerefMut for VecPerm<Pt> {
+    #[inline]
+    fn deref_mut(&mut self) -> &mut Self::Target {
+        // SAFETY: `VecPerm`, like `Perm` always holds a valid permutation.
+        unsafe { Perm::from_mut_slice_unchecked(self.vec.as_mut_slice()) }
+    }
+}
+
 impl<Pt: Point> VecPerm<Pt> {
     /// Returns a new `VecPerm` initialized to the identity permutation.
+    #[inline]
+    pub fn identity() -> Self {
+        Self::default()
+    }
+
+    /// Returns a new `VecPerm` initialized to the identity permutation.
+    #[inline]
+    pub fn identity_with_degree(degree: usize) -> Self {
+        assert!(degree <= Pt::MAX_DEGREE);
+        // SAFETY: initializes with a valid permutation
+        Self {
+            vec: (0..degree).map(Pt::from_index).collect(),
+        }
+    }
+}
+
+/// Owned permutation backed by an array.
+///
+/// These have a fixed degree and panic when assigning a permutation of a larger degree.
+#[derive(Clone, Copy)]
+pub struct ArrayPerm<Pt: Point, const N: usize> {
+    // SAFETY: must always be a valid permutation.
+    array: [Pt; N],
+}
+
+impl<Pt: Point, const N: usize> Default for ArrayPerm<Pt, N> {
+    fn default() -> Self {
+        #[allow(clippy::let_unit_value)]
+        let _ = Self::ASSERT_VALID_DEGREE;
+        assert!(N <= Pt::MAX_DEGREE);
+
+        // FUTURE: I expect this to require less/no unsafe in the future
+        let mut uninitialized: MaybeUninit<[Pt; N]> = MaybeUninit::uninit();
+        // SAFETY: `MaybeUninit<[Pt; N]>` is valid iff `[MaybeUninit<Pt>; N]` is and they have the
+        // same layout
+        let transposed = unsafe { &mut *(uninitialized.as_mut_ptr() as *mut [MaybeUninit<Pt>; N]) };
+
+        for (i, p) in transposed.iter_mut().enumerate() {
+            p.write(Pt::from_index(i));
+        }
+
+        Self {
+            // SAFETY: initialized as identity above, including a static check for the max degree
+            array: unsafe { uninitialized.assume_init() },
+        }
+    }
+}
+
+impl<Pt: Point, const N: usize> Deref for ArrayPerm<Pt, N> {
+    type Target = Perm<Pt>;
+
+    #[inline]
+    fn deref(&self) -> &Self::Target {
+        // SAFETY: `ArrayPerm`, like `Perm` always holds a valid permutation.
+        unsafe { Perm::from_slice_unchecked(self.array.as_slice()) }
+    }
+}
+
+impl<Pt: Point, const N: usize> DerefMut for ArrayPerm<Pt, N> {
+    #[inline]
+    fn deref_mut(&mut self) -> &mut Self::Target {
+        // SAFETY: `ArrayPerm`, like `Perm` always holds a valid permutation.
+        unsafe { Perm::from_mut_slice_unchecked(self.array.as_mut_slice()) }
+    }
+}
+
+impl<Pt: Point, const N: usize> ArrayPerm<Pt, N> {
+    const ASSERT_VALID_DEGREE: () = Self::assert_valid_degree();
+
+    const fn assert_valid_degree() {
+        assert!(N <= Pt::MAX_DEGREE);
+    }
+
+    /// Returns an iterator over all permutations of a fixed degree.
+    pub fn all() -> AllArrayPerms<Pt, N> {
+        Default::default()
+    }
+
+    /// Returns a new `ArrayPerm` initialized to the identity permutation.
     #[inline]
     pub fn identity() -> Self {
         Self::default()
@@ -314,6 +496,48 @@ impl<Pt: Point> StorePerm for VecPerm<Pt> {
     }
 }
 
+/// Panics when assigning a permutation with a larger degree than `N`.
+impl<Pt: Point, const N: usize> StorePerm for ArrayPerm<Pt, N> {
+    type Point = Pt;
+
+    #[inline]
+    fn build_from_perm_val(perm: impl PermVal<Self::Point>) -> Self
+    where
+        Self: Sized,
+    {
+        // FUTURE: I expect this to require less/no unsafe in the future
+        let mut uninitialized: MaybeUninit<[Pt; N]> = MaybeUninit::uninit();
+        // SAFETY: `MaybeUninit<[Pt; N]>` is valid iff `[MaybeUninit<Pt>; N]` is and they have the
+        // same layout
+        let transposed = unsafe { &mut *(uninitialized.as_mut_ptr() as *mut [MaybeUninit<Pt>; N]) };
+
+        // We use that `split_at_mut` panics when the degree is too large
+        let mut degree = perm.degree();
+        let (new_perm, fixed_suffix) = transposed.split_at_mut(degree);
+
+        // SAFETY: `PermVal` guarantees that `write_to_slice` writes a fully initialized valid
+        // permutation when the passed slice has the requested size.
+        unsafe {
+            perm.write_to_slice(new_perm);
+        };
+
+        for p in fixed_suffix {
+            p.write(Pt::from_index(degree));
+            degree += 1;
+        }
+
+        Self {
+            // SAFETY: fully initialized above
+            array: unsafe { uninitialized.assume_init() },
+        }
+    }
+
+    #[inline]
+    fn assign_perm_val(&mut self, perm: impl PermVal<Self::Point>) {
+        self.deref_mut().assign_perm_val(perm);
+    }
+}
+
 impl<T: ?Sized> StorePerm for &mut T
 where
     T: StorePerm,
@@ -350,7 +574,9 @@ where
 /// [`degree`][`Self::degree`] as well as [`write_to_slice`][`Self::write_to_slice`], as callers do
 /// rely on them for safety.
 pub unsafe trait PermVal<Pt: Point>: Sized {
-    /// Returns the size of the set the permutation is defined on.
+    /// Returns the size of the set the permutation acts on.
+    ///
+    /// See also [`Perm::degree`].
     ///
     /// # Safety
     /// Calling this repeatedly must always return the same value. Implementations of
@@ -419,91 +645,5 @@ unsafe impl<Pt: Point> PermVal<Pt> for &mut Perm<Pt> {
         // SAFETY: forwarding to `&Perm<Pt>`'s implementation upholds all safety requirements on both
         // the implementation and the call site.
         unsafe { (self as &Perm<Pt>).write_to_slice(output) }
-    }
-}
-
-pub mod ops {
-    //! Operations on permutations.
-    //!
-    //! To allow operations returning permutations without unnecessary copies or allocations, most
-    //! operations return a value of an operation-specific type that implements [`PermVal`]. Such
-    //! values can be assigned in-place to values of types implementing [`StorePerm`] via the
-    //! [`Inplace`] trait.
-    //!
-    //! This module contains such operation-specific types returned by [`Perm`]'s methods. While
-    //! they can be constructed directly using `T::new(...)`, calling the corresponding method of
-    //! [`Perm`] is usually the more ergonomic choice.
-    use super::*;
-
-    /// Inverse of a permutation.
-    ///
-    /// See [`Perm::inv`].
-    pub struct Inv<'a, Pt: Point>(&'a Perm<Pt>);
-
-    impl<'a, Pt: Point> Inv<'a, Pt> {
-        /// Returns the inverse of a permutation.
-        ///
-        /// See [`Perm::inv`].
-        #[inline]
-        pub fn new(perm: &'a Perm<Pt>) -> Self {
-            Self(perm)
-        }
-    }
-
-    // SAFETY: `write_to_slice(output)` completly overwrites `output` with a valid permutation when
-    // passed a `degree()` length slice. Here we depend on `Perm` being a valid permutation to
-    // ensure we overwrite every entry.
-    unsafe impl<Pt: Point> PermVal<Pt> for Inv<'_, Pt> {
-        #[inline]
-        fn degree(&self) -> usize {
-            self.0.degree()
-        }
-
-        #[inline]
-        unsafe fn write_to_slice(self, output: &mut [MaybeUninit<Pt>]) {
-            for (i, j) in self.0.as_slice().iter().enumerate() {
-                output[j.index()] = MaybeUninit::new(Pt::from_index(i));
-            }
-        }
-    }
-
-    /// Product of two permutations.
-    ///
-    /// See [`Perm::prod`].
-    pub struct Prod<'a, Pt: Point> {
-        pub(super) degree: usize,
-        pub(super) left: &'a Perm<Pt>,
-        pub(super) right: &'a Perm<Pt>,
-    }
-
-    impl<'a, Pt: Point> Prod<'a, Pt> {
-        /// Returns the product of two permutations.
-        ///
-        /// See [`Perm::prod`].
-        #[inline]
-        pub fn new(left: &'a Perm<Pt>, right: &'a Perm<Pt>) -> Self {
-            Prod {
-                degree: left.degree().max(right.degree()),
-                left,
-                right,
-            }
-        }
-    }
-
-    // SAFETY: `write_to_slice(output)` completly overwrites `output` with a valid permutation when
-    // passed a `degree()` length slice.
-    unsafe impl<Pt: Point> PermVal<Pt> for Prod<'_, Pt> {
-        #[inline]
-        fn degree(&self) -> usize {
-            self.degree
-        }
-
-        #[inline]
-        unsafe fn write_to_slice(self, output: &mut [MaybeUninit<Pt>]) {
-            // TODO optimized implementations
-            for (index, p) in output.iter_mut().enumerate() {
-                *p = MaybeUninit::new(self.right.image(self.left.image_of_index(index)));
-            }
-        }
     }
 }

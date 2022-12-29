@@ -7,6 +7,7 @@
 #![warn(clippy::undocumented_unsafe_blocks)]
 #![allow(clippy::comparison_chain)]
 
+pub mod cycles;
 pub mod inplace;
 pub mod perm;
 pub mod point;
