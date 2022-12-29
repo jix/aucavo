@@ -19,6 +19,13 @@ pub struct Perm<P: Point> {
 }
 
 impl<P: Point> Perm<P> {
+    /// The identity permutation.
+    #[inline]
+    pub const fn identity() -> &'static Self {
+        // SAFETY: an empty slice is a valid permutation
+        unsafe { Self::from_slice_unchecked(&[]) }
+    }
+
     /// Checks whether a slice contains permutation of `0..slice.len()`.
     ///
     /// If the length of `slice` exceeds `P::MAX_DEGREE` this also returns `false`, even when it
@@ -65,7 +72,7 @@ impl<P: Point> Perm<P> {
     /// # Safety
     /// The argument `slice` must be a permutation of the points `0..slice.len()`.
     #[inline]
-    pub unsafe fn from_slice_unchecked(slice: &[P]) -> &Self {
+    pub const unsafe fn from_slice_unchecked(slice: &[P]) -> &Self {
         // SAFETY: `Self` is a `repr(transparent)` wrapper for `[P]`
         unsafe { &*(slice as *const [P] as *const Self) }
     }
@@ -161,6 +168,7 @@ impl<P: Point> Perm<P> {
 /// Owned permutation backed by a [`Vec`].
 ///
 /// Most functionality is provided via the [`Deref`] implementation to [`Perm`].
+#[derive(Default)]
 pub struct VecPerm<P: Point> {
     // SAFETY: must always be a valid permutation.
     vec: Vec<P>,
@@ -173,6 +181,14 @@ impl<P: Point> Deref for VecPerm<P> {
     fn deref(&self) -> &Self::Target {
         // SAFETY: `VecPerm`, like `Perm` always holds a valid permutation.
         unsafe { Perm::from_slice_unchecked(self.vec.as_slice()) }
+    }
+}
+
+impl<P: Point> VecPerm<P> {
+    /// Returns a new `VecPerm` initialized to the identity permutation.
+    #[inline]
+    pub fn identity() -> Self {
+        Self::default()
     }
 }
 
