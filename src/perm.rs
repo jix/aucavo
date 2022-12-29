@@ -1,7 +1,9 @@
 //! Permutations.
 use std::{
+    borrow::Borrow,
+    cmp, fmt, hash,
     mem::MaybeUninit,
-    ops::{Deref, DerefMut, Range}, fmt,
+    ops::{Deref, DerefMut, Range},
 };
 
 use smallvec::{smallvec, SmallVec};
@@ -260,6 +262,88 @@ impl<Pt: Point> fmt::Debug for Perm<Pt> {
     }
 }
 
+impl<Pt: Point, Rhs: Borrow<Perm<Pt>> + ?Sized> PartialEq<Rhs> for Perm<Pt> {
+    #[inline]
+    fn eq(&self, other: &Rhs) -> bool {
+        let mut lhs = self;
+        let mut rhs = other.borrow();
+
+        if lhs.degree() != rhs.degree() {
+            (lhs, rhs) = Self::eq_fixup(lhs, rhs);
+        }
+
+        lhs.as_slice() == rhs.as_slice()
+    }
+}
+
+impl<Pt: Point> Perm<Pt> {
+    #[inline]
+    #[cold] // TUNE
+    fn eq_fixup<'a>(mut lhs: &'a Self, mut rhs: &'a Self) -> (&'a Self, &'a Self) {
+        if lhs.degree() > rhs.degree() {
+            (lhs, rhs) = (rhs, lhs);
+        }
+        rhs = rhs.shrink_to_degree(lhs.degree());
+        (lhs, rhs)
+    }
+}
+
+impl<Pt: Point> Eq for Perm<Pt> {}
+
+impl<Pt: Point> hash::Hash for Perm<Pt> {
+    #[inline]
+    fn hash<H: hash::Hasher>(&self, state: &mut H) {
+        let min_degree = self.as_min_degree();
+        min_degree.as_slice().hash(state);
+    }
+}
+
+impl<Pt: Point, Rhs: Borrow<Perm<Pt>> + ?Sized> PartialOrd<Rhs> for Perm<Pt> {
+    #[inline]
+    fn partial_cmp(&self, other: &Rhs) -> Option<cmp::Ordering> {
+        Some(self.cmp(other.borrow()))
+    }
+}
+
+impl<Pt: Point> Ord for Perm<Pt> {
+    #[inline]
+    fn cmp(&self, other: &Self) -> cmp::Ordering {
+        let mut lhs = self;
+        let mut rhs = other;
+        let mut flip = false;
+
+        if lhs.degree() != rhs.degree() {
+            (lhs, rhs, flip) = Self::cmp_fixup(lhs, rhs);
+        }
+
+        let mut result = lhs.as_slice().cmp(&rhs.as_slice()[..lhs.as_slice().len()]);
+
+        if result.is_eq() && lhs.degree() != rhs.degree() {
+            result = cmp::Ordering::Less;
+        }
+
+        if flip {
+            result.reverse()
+        } else {
+            result
+        }
+    }
+}
+
+impl<Pt: Point> Perm<Pt> {
+    #[inline]
+    #[cold] // TUNE
+    fn cmp_fixup<'a>(mut lhs: &'a Self, mut rhs: &'a Self) -> (&'a Self, &'a Self, bool) {
+        let mut flip = false;
+        if lhs.degree() > rhs.degree() {
+            (lhs, rhs) = (rhs, lhs);
+            flip = true;
+        }
+        rhs = rhs.shrink_to_degree(lhs.degree());
+        (lhs, rhs, flip)
+    }
+}
+
 /// Owned permutation backed by a [`Vec`].
 ///
 /// Most functionality is provided via the [`Deref`] implementation to [`Perm`].
@@ -284,6 +368,43 @@ impl<Pt: Point> DerefMut for VecPerm<Pt> {
     fn deref_mut(&mut self) -> &mut Self::Target {
         // SAFETY: `VecPerm`, like `Perm` always holds a valid permutation.
         unsafe { Perm::from_mut_slice_unchecked(self.vec.as_mut_slice()) }
+    }
+}
+
+impl<Pt: Point> Borrow<Perm<Pt>> for VecPerm<Pt> {
+    #[inline]
+    fn borrow(&self) -> &Perm<Pt> {
+        self.deref()
+    }
+}
+
+impl<Pt: Point, Rhs: Borrow<Perm<Pt>> + ?Sized> PartialEq<Rhs> for VecPerm<Pt> {
+    #[inline]
+    fn eq(&self, other: &Rhs) -> bool {
+        self.deref().eq(other.borrow())
+    }
+}
+
+impl<Pt: Point, Rhs: Borrow<Perm<Pt>> + ?Sized> PartialOrd<Rhs> for VecPerm<Pt> {
+    #[inline]
+    fn partial_cmp(&self, other: &Rhs) -> Option<cmp::Ordering> {
+        Some(self.deref().cmp(other.borrow()))
+    }
+}
+
+impl<Pt: Point> Eq for VecPerm<Pt> {}
+
+impl<Pt: Point> Ord for VecPerm<Pt> {
+    #[inline]
+    fn cmp(&self, other: &Self) -> cmp::Ordering {
+        self.deref().cmp(other.deref())
+    }
+}
+
+impl<Pt: Point> hash::Hash for VecPerm<Pt> {
+    #[inline]
+    fn hash<H: hash::Hasher>(&self, state: &mut H) {
+        self.deref().hash(state);
     }
 }
 
@@ -352,6 +473,47 @@ impl<Pt: Point, const N: usize> DerefMut for ArrayPerm<Pt, N> {
     fn deref_mut(&mut self) -> &mut Self::Target {
         // SAFETY: `ArrayPerm`, like `Perm` always holds a valid permutation.
         unsafe { Perm::from_mut_slice_unchecked(self.array.as_mut_slice()) }
+    }
+}
+
+impl<Pt: Point, const N: usize> Borrow<Perm<Pt>> for ArrayPerm<Pt, N> {
+    #[inline]
+    fn borrow(&self) -> &Perm<Pt> {
+        self.deref()
+    }
+}
+
+impl<Pt: Point, Rhs: Borrow<Perm<Pt>> + ?Sized, const N: usize> PartialEq<Rhs>
+    for ArrayPerm<Pt, N>
+{
+    #[inline]
+    fn eq(&self, other: &Rhs) -> bool {
+        self.deref().eq(other.borrow())
+    }
+}
+
+impl<Pt: Point, Rhs: Borrow<Perm<Pt>> + ?Sized, const N: usize> PartialOrd<Rhs>
+    for ArrayPerm<Pt, N>
+{
+    #[inline]
+    fn partial_cmp(&self, other: &Rhs) -> Option<cmp::Ordering> {
+        Some(self.deref().cmp(other.borrow()))
+    }
+}
+
+impl<Pt: Point, const N: usize> Eq for ArrayPerm<Pt, N> {}
+
+impl<Pt: Point, const N: usize> Ord for ArrayPerm<Pt, N> {
+    #[inline]
+    fn cmp(&self, other: &Self) -> cmp::Ordering {
+        self.deref().cmp(other.deref())
+    }
+}
+
+impl<Pt: Point, const N: usize> hash::Hash for ArrayPerm<Pt, N> {
+    #[inline]
+    fn hash<H: hash::Hasher>(&self, state: &mut H) {
+        self.deref().hash(state);
     }
 }
 
@@ -645,5 +807,19 @@ unsafe impl<Pt: Point> PermVal<Pt> for &mut Perm<Pt> {
         // SAFETY: forwarding to `&Perm<Pt>`'s implementation upholds all safety requirements on both
         // the implementation and the call site.
         unsafe { (self as &Perm<Pt>).write_to_slice(output) }
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn array_perm_all_order() {
+        let perms: Vec<_> = ArrayPerm::<u8, 7>::all().collect();
+
+        for pairs in perms.windows(2) {
+            assert!(pairs[0] < pairs[1]);
+        }
     }
 }
