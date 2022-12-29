@@ -88,22 +88,22 @@ impl_pt!(U8 u8, U16 u16, U32 u32);
 impl_pt!(U64 u64);
 
 /// Iterator over a consecutive range of points.
-pub type PointRange<P> = PointIter<P, Range<usize>>;
+pub type PointRange<Pt> = PointIter<Pt, Range<usize>>;
 
 /// Iterator wrapper that turns an iterator over indices into an iterator over points.
-pub struct PointIter<P, I> {
+pub struct PointIter<Pt, I> {
     indices: I,
-    _phantom: std::marker::PhantomData<P>,
+    _phantom: std::marker::PhantomData<Pt>,
 }
 
-impl<P, I> PointIter<P, I> {
+impl<Pt, I> PointIter<Pt, I> {
     /// Returns an iterator over the point's indices.
     pub fn indices(self) -> I {
         self.indices
     }
 }
 
-impl<P, I> PointIter<P, I> {
+impl<Pt, I> PointIter<Pt, I> {
     /// Retturns an iterator over the points of the given indices.
     pub fn new(indices: I) -> Self {
         Self {
@@ -113,12 +113,12 @@ impl<P, I> PointIter<P, I> {
     }
 }
 
-impl<P: Point, I: Iterator<Item = usize>> Iterator for PointIter<P, I> {
-    type Item = P;
+impl<Pt: Point, I: Iterator<Item = usize>> Iterator for PointIter<Pt, I> {
+    type Item = Pt;
 
     #[inline]
     fn next(&mut self) -> Option<Self::Item> {
-        self.indices.next().map(P::from_index)
+        self.indices.next().map(Pt::from_index)
     }
 
     #[inline]
@@ -127,14 +127,14 @@ impl<P: Point, I: Iterator<Item = usize>> Iterator for PointIter<P, I> {
     }
 }
 
-impl<P: Point, I: DoubleEndedIterator<Item = usize>> DoubleEndedIterator for PointIter<P, I> {
+impl<Pt: Point, I: DoubleEndedIterator<Item = usize>> DoubleEndedIterator for PointIter<Pt, I> {
     #[inline]
     fn next_back(&mut self) -> Option<Self::Item> {
-        self.indices.next_back().map(P::from_index)
+        self.indices.next_back().map(Pt::from_index)
     }
 }
 
-impl<P: Point, I: ExactSizeIterator<Item = usize>> ExactSizeIterator for PointIter<P, I> {
+impl<Pt: Point, I: ExactSizeIterator<Item = usize>> ExactSizeIterator for PointIter<Pt, I> {
     #[inline]
     fn len(&self) -> usize {
         self.indices.len()
