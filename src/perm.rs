@@ -1,7 +1,9 @@
 //! Permutations.
 use std::{
     borrow::Borrow,
-    cmp, fmt, hash,
+    cmp,
+    convert::Infallible,
+    fmt, hash,
     mem::MaybeUninit,
     ops::{Deref, DerefMut, Range},
 };
@@ -371,6 +373,18 @@ impl<Pt: Point> DerefMut for VecPerm<Pt> {
     }
 }
 
+impl<Pt: Point> fmt::Display for VecPerm<Pt> {
+    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+        fmt::Display::fmt(self.deref(), f)
+    }
+}
+
+impl<Pt: Point> fmt::Debug for VecPerm<Pt> {
+    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+        fmt::Debug::fmt(self.deref(), f)
+    }
+}
+
 impl<Pt: Point> Borrow<Perm<Pt>> for VecPerm<Pt> {
     #[inline]
     fn borrow(&self) -> &Perm<Pt> {
@@ -473,6 +487,18 @@ impl<Pt: Point, const N: usize> DerefMut for ArrayPerm<Pt, N> {
     fn deref_mut(&mut self) -> &mut Self::Target {
         // SAFETY: `ArrayPerm`, like `Perm` always holds a valid permutation.
         unsafe { Perm::from_mut_slice_unchecked(self.array.as_mut_slice()) }
+    }
+}
+
+impl<Pt: Point, const N: usize> fmt::Display for ArrayPerm<Pt, N> {
+    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+        fmt::Display::fmt(self.deref(), f)
+    }
+}
+
+impl<Pt: Point, const N: usize> fmt::Debug for ArrayPerm<Pt, N> {
+    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+        fmt::Debug::fmt(self.deref(), f)
     }
 }
 
@@ -762,17 +788,20 @@ impl<O: StorePerm + ?Sized, T> Inplace<O, InplacePerm> for T
 where
     T: PermVal<O::Point>,
 {
+    type Err = Infallible;
+
     #[inline]
-    fn build(self) -> O
+    fn try_build(self) -> Result<O, Self::Err>
     where
         O: Sized,
     {
-        O::build_from_perm_val(self)
+        Ok(O::build_from_perm_val(self))
     }
 
     #[inline]
-    fn assign_to(self, output: &mut O) {
-        O::assign_perm_val(output, self)
+    fn try_assign_to(self, output: &mut O) -> Result<(), Self::Err> {
+        O::assign_perm_val(output, self);
+        Ok(())
     }
 }
 

@@ -1,5 +1,5 @@
 //! Points in finite structures.
-use std::{fmt, hash::Hash, ops::Range};
+use std::{fmt, hash::Hash, num::ParseIntError, ops::Range, str::FromStr};
 
 pub(crate) mod sealed {
     /// # Safety
@@ -31,7 +31,16 @@ compile_error!(
 /// This type should only be implemented for unsigned primitive integer types. To enforce this, this
 /// trait is sealed.
 pub trait Point:
-    Copy + Clone + Default + Ord + Hash + fmt::Display + fmt::Debug + sealed::Sealed + 'static
+    Copy
+    + Clone
+    + Default
+    + Ord
+    + Hash
+    + FromStr<Err = ParseIntError>
+    + fmt::Display
+    + fmt::Debug
+    + sealed::Sealed
+    + 'static
 {
     /// Maximal number of points in a finite structure using this type as point representation.
     const MAX_DEGREE: usize;

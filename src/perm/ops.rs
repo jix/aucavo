@@ -46,9 +46,9 @@ unsafe impl<Pt: Point> PermVal<Pt> for Inv<'_, Pt> {
 ///
 /// See [`Perm::prod`].
 pub struct Prod<'a, Pt: Point> {
-    pub(super) degree: usize,
-    pub(super) left: &'a Perm<Pt>,
-    pub(super) right: &'a Perm<Pt>,
+    degree: usize,
+    left: &'a Perm<Pt>,
+    right: &'a Perm<Pt>,
 }
 
 impl<'a, Pt: Point> Prod<'a, Pt> {
