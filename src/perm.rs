@@ -1,27 +1,27 @@
 //! Permutations.
-use std::{
-    borrow::Borrow,
-    cmp,
-    convert::Infallible,
-    fmt, hash,
-    mem::MaybeUninit,
-    ops::{Deref, DerefMut, Range},
-    str::FromStr,
-};
+use std::{borrow::Borrow, cmp, convert::Infallible, fmt, hash, mem::MaybeUninit, ops::Range};
 
 use smallvec::{smallvec, SmallVec};
 
 use crate::{
-    cycles::{self, CycleDecomposition},
+    cycles::CycleDecomposition,
     gap,
-    inplace::{AssignInplace, Inplace},
+    inplace::{AssignInplace, Inplace, InplaceWithTemp},
     point::{Point, PointIter, PointRange},
 };
 
-use self::iter::{AllArrayPerms, Iter};
+use self::iter::Iter;
 
 pub mod iter;
 pub mod ops;
+
+mod array_perm;
+mod small_perm;
+mod vec_perm;
+
+pub use array_perm::ArrayPerm;
+pub use small_perm::SmallPerm;
+pub use vec_perm::VecPerm;
 
 /// A permutation.
 #[repr(transparent)]
@@ -240,6 +240,11 @@ impl<Pt: Point> Perm<Pt> {
         ops::Prod::new(self, other)
     }
 
+    #[inline]
+    pub fn pow(&self, exp: isize) -> ops::Pow<Pt> {
+        ops::Pow::new(self, exp)
+    }
+
     /// Advances to the lexicographically next permutation.
     ///
     /// This steps lexicographically through permutations of the same degree. It returns `false` and
@@ -366,266 +371,6 @@ impl<Pt: Point> Perm<Pt> {
     }
 }
 
-/// Owned permutation backed by a [`Vec`].
-///
-/// Most functionality is provided via the [`Deref`] implementation to [`Perm`].
-#[derive(Default)]
-pub struct VecPerm<Pt: Point> {
-    // SAFETY: must always be a valid permutation.
-    vec: Vec<Pt>,
-}
-
-impl<Pt: Point> Deref for VecPerm<Pt> {
-    type Target = Perm<Pt>;
-
-    #[inline]
-    fn deref(&self) -> &Self::Target {
-        // SAFETY: `VecPerm`, like `Perm` always holds a valid permutation.
-        unsafe { Perm::from_slice_unchecked(self.vec.as_slice()) }
-    }
-}
-
-impl<Pt: Point> DerefMut for VecPerm<Pt> {
-    #[inline]
-    fn deref_mut(&mut self) -> &mut Self::Target {
-        // SAFETY: `VecPerm`, like `Perm` always holds a valid permutation.
-        unsafe { Perm::from_mut_slice_unchecked(self.vec.as_mut_slice()) }
-    }
-}
-
-impl<Pt: Point> fmt::Display for VecPerm<Pt> {
-    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
-        fmt::Display::fmt(self.deref(), f)
-    }
-}
-
-impl<Pt: Point> gap::FmtGap for VecPerm<Pt> {
-    fn fmt_gap(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
-        self.deref().fmt_gap(f)
-    }
-}
-
-impl<Pt: Point> fmt::Debug for VecPerm<Pt> {
-    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
-        fmt::Debug::fmt(self.deref(), f)
-    }
-}
-
-impl<Pt: Point> FromStr for VecPerm<Pt> {
-    type Err = cycles::ParseError;
-
-    fn from_str(s: &str) -> Result<Self, Self::Err> {
-        Perm::parse(s).try_build()
-    }
-}
-
-impl<Pt: Point> gap::FromGapStr for VecPerm<Pt> {
-    type Err = cycles::ParseError;
-
-    fn from_gap_str(s: &str) -> Result<Self, Self::Err> {
-        Perm::parse_gap(s).try_build()
-    }
-}
-
-impl<Pt: Point> Borrow<Perm<Pt>> for VecPerm<Pt> {
-    #[inline]
-    fn borrow(&self) -> &Perm<Pt> {
-        self.deref()
-    }
-}
-
-impl<Pt: Point, Rhs: Borrow<Perm<Pt>> + ?Sized> PartialEq<Rhs> for VecPerm<Pt> {
-    #[inline]
-    fn eq(&self, other: &Rhs) -> bool {
-        self.deref().eq(other.borrow())
-    }
-}
-
-impl<Pt: Point, Rhs: Borrow<Perm<Pt>> + ?Sized> PartialOrd<Rhs> for VecPerm<Pt> {
-    #[inline]
-    fn partial_cmp(&self, other: &Rhs) -> Option<cmp::Ordering> {
-        Some(self.deref().cmp(other.borrow()))
-    }
-}
-
-impl<Pt: Point> Eq for VecPerm<Pt> {}
-
-impl<Pt: Point> Ord for VecPerm<Pt> {
-    #[inline]
-    fn cmp(&self, other: &Self) -> cmp::Ordering {
-        self.deref().cmp(other.deref())
-    }
-}
-
-impl<Pt: Point> hash::Hash for VecPerm<Pt> {
-    #[inline]
-    fn hash<H: hash::Hasher>(&self, state: &mut H) {
-        self.deref().hash(state);
-    }
-}
-
-impl<Pt: Point> VecPerm<Pt> {
-    /// Returns a new `VecPerm` initialized to the identity permutation.
-    #[inline]
-    pub fn identity() -> Self {
-        Self::default()
-    }
-
-    /// Returns a new `VecPerm` initialized to the identity permutation.
-    #[inline]
-    pub fn identity_with_degree(degree: usize) -> Self {
-        assert!(degree <= Pt::MAX_DEGREE);
-        // SAFETY: initializes with a valid permutation
-        Self {
-            vec: (0..degree).map(Pt::from_index).collect(),
-        }
-    }
-}
-
-/// Owned permutation backed by an array.
-///
-/// These have a fixed degree and panic when assigning a permutation of a larger degree.
-#[derive(Clone, Copy)]
-pub struct ArrayPerm<Pt: Point, const N: usize> {
-    // SAFETY: must always be a valid permutation.
-    array: [Pt; N],
-}
-
-impl<Pt: Point, const N: usize> Default for ArrayPerm<Pt, N> {
-    fn default() -> Self {
-        #[allow(clippy::let_unit_value)]
-        let _ = Self::ASSERT_VALID_DEGREE;
-        assert!(N <= Pt::MAX_DEGREE);
-
-        // FUTURE: I expect this to require less/no unsafe in the future
-        let mut uninitialized: MaybeUninit<[Pt; N]> = MaybeUninit::uninit();
-        // SAFETY: `MaybeUninit<[Pt; N]>` is valid iff `[MaybeUninit<Pt>; N]` is and they have the
-        // same layout
-        let transposed = unsafe { &mut *(uninitialized.as_mut_ptr() as *mut [MaybeUninit<Pt>; N]) };
-
-        for (i, p) in transposed.iter_mut().enumerate() {
-            p.write(Pt::from_index(i));
-        }
-
-        Self {
-            // SAFETY: initialized as identity above, including a static check for the max degree
-            array: unsafe { uninitialized.assume_init() },
-        }
-    }
-}
-
-impl<Pt: Point, const N: usize> Deref for ArrayPerm<Pt, N> {
-    type Target = Perm<Pt>;
-
-    #[inline]
-    fn deref(&self) -> &Self::Target {
-        // SAFETY: `ArrayPerm`, like `Perm` always holds a valid permutation.
-        unsafe { Perm::from_slice_unchecked(self.array.as_slice()) }
-    }
-}
-
-impl<Pt: Point, const N: usize> DerefMut for ArrayPerm<Pt, N> {
-    #[inline]
-    fn deref_mut(&mut self) -> &mut Self::Target {
-        // SAFETY: `ArrayPerm`, like `Perm` always holds a valid permutation.
-        unsafe { Perm::from_mut_slice_unchecked(self.array.as_mut_slice()) }
-    }
-}
-
-impl<Pt: Point, const N: usize> fmt::Display for ArrayPerm<Pt, N> {
-    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
-        fmt::Display::fmt(self.deref(), f)
-    }
-}
-
-impl<Pt: Point, const N: usize> gap::FmtGap for ArrayPerm<Pt, N> {
-    fn fmt_gap(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
-        self.deref().fmt_gap(f)
-    }
-}
-
-impl<Pt: Point, const N: usize> fmt::Debug for ArrayPerm<Pt, N> {
-    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
-        fmt::Debug::fmt(self.deref(), f)
-    }
-}
-
-impl<Pt: Point, const N: usize> FromStr for ArrayPerm<Pt, N> {
-    type Err = cycles::ParseError;
-
-    fn from_str(s: &str) -> Result<Self, Self::Err> {
-        Perm::parse(s).try_build()
-    }
-}
-
-impl<Pt: Point, const N: usize> gap::FromGapStr for ArrayPerm<Pt, N> {
-    type Err = cycles::ParseError;
-
-    fn from_gap_str(s: &str) -> Result<Self, Self::Err> {
-        Perm::parse_gap(s).try_build()
-    }
-}
-
-impl<Pt: Point, const N: usize> Borrow<Perm<Pt>> for ArrayPerm<Pt, N> {
-    #[inline]
-    fn borrow(&self) -> &Perm<Pt> {
-        self.deref()
-    }
-}
-
-impl<Pt: Point, Rhs: Borrow<Perm<Pt>> + ?Sized, const N: usize> PartialEq<Rhs>
-    for ArrayPerm<Pt, N>
-{
-    #[inline]
-    fn eq(&self, other: &Rhs) -> bool {
-        self.deref().eq(other.borrow())
-    }
-}
-
-impl<Pt: Point, Rhs: Borrow<Perm<Pt>> + ?Sized, const N: usize> PartialOrd<Rhs>
-    for ArrayPerm<Pt, N>
-{
-    #[inline]
-    fn partial_cmp(&self, other: &Rhs) -> Option<cmp::Ordering> {
-        Some(self.deref().cmp(other.borrow()))
-    }
-}
-
-impl<Pt: Point, const N: usize> Eq for ArrayPerm<Pt, N> {}
-
-impl<Pt: Point, const N: usize> Ord for ArrayPerm<Pt, N> {
-    #[inline]
-    fn cmp(&self, other: &Self) -> cmp::Ordering {
-        self.deref().cmp(other.deref())
-    }
-}
-
-impl<Pt: Point, const N: usize> hash::Hash for ArrayPerm<Pt, N> {
-    #[inline]
-    fn hash<H: hash::Hasher>(&self, state: &mut H) {
-        self.deref().hash(state);
-    }
-}
-
-impl<Pt: Point, const N: usize> ArrayPerm<Pt, N> {
-    const ASSERT_VALID_DEGREE: () = Self::assert_valid_degree();
-
-    const fn assert_valid_degree() {
-        assert!(N <= Pt::MAX_DEGREE);
-    }
-
-    /// Returns an iterator over all permutations of a fixed degree.
-    pub fn all() -> AllArrayPerms<Pt, N> {
-        Default::default()
-    }
-
-    /// Returns a new `ArrayPerm` initialized to the identity permutation.
-    #[inline]
-    pub fn identity() -> Self {
-        Self::default()
-    }
-}
-
 /// Types that can store a permutation.
 ///
 /// Implementing this trait allows storing [`PermVal`]s in the implementing type via the blanket
@@ -656,6 +401,19 @@ pub trait StorePerm {
     /// Callers should use the blanket implementation of [`Inplace`] instead of calling this
     /// directly.
     fn assign_perm_val(&mut self, perm: impl PermVal<Self::Point>);
+
+    fn build_from_perm_val_with_temp<V: PermValWithTemp<Self::Point>>(
+        perm: V,
+        temp: &mut V::Temp,
+    ) -> Self
+    where
+        Self: Sized;
+
+    fn assign_perm_val_with_temp<V: PermValWithTemp<Self::Point>>(
+        &mut self,
+        perm: V,
+        temp: &mut V::Temp,
+    );
 
     // TODO unchecked/checked methods for assignment with matching degree?
     // TODO consts and/or subtraits indiciating the growing behavior?
@@ -691,102 +449,40 @@ impl<Pt: Point> StorePerm for Perm<Pt> {
             degree += 1;
         }
     }
-}
 
-/// Allocates new storage when assigning a permutation with a larger degree than the existing value.
-///
-/// The implementation uses `reserve_exact` to only allocate as much memory as required. While this
-/// saves memory for typical uses cases involving permutations, it can cause quadratic runtime when
-/// gorwing the degree of a permutation one at a time.
-impl<Pt: Point> StorePerm for VecPerm<Pt> {
-    type Point = Pt;
-
-    #[inline]
-    fn build_from_perm_val(perm: impl PermVal<Pt>) -> Self
+    fn build_from_perm_val_with_temp<V: PermValWithTemp<Self::Point>>(
+        _perm: V,
+        _temp: &mut V::Temp,
+    ) -> Self
     where
         Self: Sized,
     {
-        let degree = perm.degree();
-        let mut vec = Vec::with_capacity(degree);
-
-        // SAFETY: `get_unchecked_mut` is in bounds as we reserved sufficient capacity, `set_len` is
-        // allowed as `PermVal` guarantees that `write_to_slice` writes a fully initialized valid
-        // permutation when the passed slice has the requested size.
-        unsafe {
-            perm.write_to_slice(vec.spare_capacity_mut().get_unchecked_mut(..degree));
-            vec.set_len(degree);
-        }
-
-        Self { vec }
+        unreachable!()
     }
 
     #[inline]
-    fn assign_perm_val(&mut self, perm: impl PermVal<Pt>) {
+    fn assign_perm_val_with_temp<V: PermValWithTemp<Self::Point>>(
+        &mut self,
+        perm: V,
+        temp: &mut V::Temp,
+    ) {
         let mut degree = perm.degree();
-
-        let new_degree = self.vec.len().max(degree);
-
-        self.vec.clear();
-        self.vec.reserve_exact(new_degree);
-
-        // SAFETY: `get_unchecked_mut` is in bounds as we reserved sufficient capacity, `set_len` is
-        // allowed as `PermVal` guarantees that `write_to_slice` writes a fully initialized valid
-        // permutation when the passed slice has the requested size. In the case that `new_degree >
-        // degree` the missing values are already initialized, but need to be overwritten as fixed
-        // points to maintain `VecPerm`'s invariant.
-        unsafe {
-            let data = self.vec.spare_capacity_mut();
-            perm.write_to_slice(data.get_unchecked_mut(..degree));
-
-            for p in data.get_unchecked_mut(degree..new_degree) {
-                *p = MaybeUninit::new(Pt::from_index(degree));
-                degree += 1;
-            }
-
-            self.vec.set_len(new_degree);
-        }
-    }
-}
-
-/// Panics when assigning a permutation with a larger degree than `N`.
-impl<Pt: Point, const N: usize> StorePerm for ArrayPerm<Pt, N> {
-    type Point = Pt;
-
-    #[inline]
-    fn build_from_perm_val(perm: impl PermVal<Self::Point>) -> Self
-    where
-        Self: Sized,
-    {
-        // FUTURE: I expect this to require less/no unsafe in the future
-        let mut uninitialized: MaybeUninit<[Pt; N]> = MaybeUninit::uninit();
-        // SAFETY: `MaybeUninit<[Pt; N]>` is valid iff `[MaybeUninit<Pt>; N]` is and they have the
-        // same layout
-        let transposed = unsafe { &mut *(uninitialized.as_mut_ptr() as *mut [MaybeUninit<Pt>; N]) };
 
         // We use that `split_at_mut` panics when the degree is too large
-        let mut degree = perm.degree();
-        let (new_perm, fixed_suffix) = transposed.split_at_mut(degree);
+        let (new_perm, fixed_suffix) = self.slice.split_at_mut(degree);
 
         // SAFETY: `PermVal` guarantees that `write_to_slice` writes a fully initialized valid
         // permutation when the passed slice has the requested size.
         unsafe {
-            perm.write_to_slice(new_perm);
+            let new_perm: &mut [MaybeUninit<Pt>] =
+                &mut *(new_perm as *mut [Pt] as *mut [MaybeUninit<Pt>]);
+            perm.write_to_slice_with_temp(new_perm, temp);
         };
 
         for p in fixed_suffix {
-            p.write(Pt::from_index(degree));
+            *p = Pt::from_index(degree);
             degree += 1;
         }
-
-        Self {
-            // SAFETY: fully initialized above
-            array: unsafe { uninitialized.assume_init() },
-        }
-    }
-
-    #[inline]
-    fn assign_perm_val(&mut self, perm: impl PermVal<Self::Point>) {
-        self.deref_mut().assign_perm_val(perm);
     }
 }
 
@@ -805,6 +501,25 @@ where
     #[inline]
     fn assign_perm_val(&mut self, perm: impl PermVal<Self::Point>) {
         T::assign_perm_val(self, perm)
+    }
+
+    fn build_from_perm_val_with_temp<V: PermValWithTemp<Self::Point>>(
+        _perm: V,
+        _temp: &mut V::Temp,
+    ) -> Self
+    where
+        Self: Sized,
+    {
+        unreachable!()
+    }
+
+    #[inline]
+    fn assign_perm_val_with_temp<V: PermValWithTemp<Self::Point>>(
+        &mut self,
+        perm: V,
+        temp: &mut V::Temp,
+    ) {
+        T::assign_perm_val_with_temp(self, perm, temp)
     }
 }
 
@@ -845,6 +560,11 @@ pub unsafe trait PermVal<Pt: Point>: Sized {
     unsafe fn write_to_slice(self, output: &mut [MaybeUninit<Pt>]);
 }
 
+pub unsafe trait PermValWithTemp<Pt: Point>: PermVal<Pt> {
+    type Temp: Default;
+    unsafe fn write_to_slice_with_temp(self, output: &mut [MaybeUninit<Pt>], temp: &mut Self::Temp);
+}
+
 /// Disambiguator for the [`Inplace`] impl assigning [`PermVal`]s to [`StorePerm`]s.
 pub enum InplacePerm {}
 
@@ -865,6 +585,31 @@ where
     #[inline]
     fn try_assign_to(self, output: &mut O) -> Result<(), Self::Err> {
         O::assign_perm_val(output, self);
+        Ok(())
+    }
+}
+
+impl<O: StorePerm + ?Sized, T> InplaceWithTemp<O, InplacePerm> for T
+where
+    T: PermValWithTemp<O::Point>,
+{
+    type Temp = T::Temp;
+
+    #[inline]
+    fn try_build_with_temp(self, temp: &mut Self::Temp) -> Result<O, Self::Err>
+    where
+        O: Sized,
+    {
+        Ok(O::build_from_perm_val_with_temp(self, temp))
+    }
+
+    #[inline]
+    fn try_assign_to_with_temp(
+        self,
+        output: &mut O,
+        temp: &mut Self::Temp,
+    ) -> Result<(), Self::Err> {
+        O::assign_perm_val_with_temp(output, self, temp);
         Ok(())
     }
 }
@@ -940,6 +685,26 @@ mod tests {
     #[test]
     fn parse_array_perm() {
         let mut g: ArrayPerm<u8, 5> = Default::default();
+
+        for h in ArrayPerm::<u8, 5>::all() {
+            g.try_assign(Perm::parse(&h.to_string())).unwrap();
+            assert_eq!(g, h);
+        }
+    }
+
+    #[test]
+    fn parse_small_perm_tiny() {
+        let mut g: SmallPerm<u8, 4> = Default::default();
+
+        for h in ArrayPerm::<u8, 5>::all() {
+            g.try_assign(Perm::parse(&h.to_string())).unwrap();
+            assert_eq!(g, h);
+        }
+    }
+
+    #[test]
+    fn parse_small_perm_large() {
+        let mut g: SmallPerm<u8, 16> = Default::default();
 
         for h in ArrayPerm::<u8, 5>::all() {
             g.try_assign(Perm::parse(&h.to_string())).unwrap();

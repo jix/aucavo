@@ -85,6 +85,53 @@ unsafe impl<Pt: Point> PermVal<Pt> for Prod<'_, Pt> {
     }
 }
 
+/// Power of a permutations.
+///
+/// See [`Perm::pow`].
+pub struct Pow<'a, Pt: Point> {
+    perm: &'a Perm<Pt>,
+    exp: isize,
+}
+
+impl<'a, Pt: Point> Pow<'a, Pt> {
+    /// Returns the power of a permutations.
+    ///
+    /// See [`Perm::pow`].
+    #[inline]
+    pub fn new(perm: &'a Perm<Pt>, exp: isize) -> Self {
+        Pow { perm, exp }
+    }
+}
+
+// SAFETY: `write_to_slice(output)` completly overwrites `output` with a valid permutation when
+// passed a `degree()` length slice.
+unsafe impl<Pt: Point> PermVal<Pt> for Pow<'_, Pt> {
+    #[inline]
+    fn degree(&self) -> usize {
+        self.perm.degree()
+    }
+
+    #[inline]
+    unsafe fn write_to_slice(self, output: &mut [MaybeUninit<Pt>]) {
+        unsafe { self.write_to_slice_with_temp(output, &mut Default::default()) }
+    }
+}
+
+// SAFETY: `write_to_slice(output)` completly overwrites `output` with a valid permutation when
+// passed a `degree()` length slice.
+unsafe impl<Pt: Point> PermValWithTemp<Pt> for Pow<'_, Pt> {
+    type Temp = SmallPerm<Pt, 128>;
+
+    #[inline]
+    unsafe fn write_to_slice_with_temp(
+        self,
+        output: &mut [MaybeUninit<Pt>],
+        temp: &mut Self::Temp,
+    ) {
+        todo!()
+    }
+}
+
 /// Disambiguator for the [`Inplace`] impl of [`Parse`].
 pub enum ParseInplace {}
 
