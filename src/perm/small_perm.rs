@@ -15,7 +15,7 @@ use crate::{
     point::Point,
 };
 
-use super::{Perm, PermVal, PermValWithTemp, StorePerm};
+use super::{raw::MaybeUninitPerm, Perm, StorePerm};
 
 /// Owned permutation backed by a [`SmallVec`].
 ///
@@ -142,122 +142,67 @@ impl<Pt: Point, const N: usize> SmallPerm<Pt, N> {
 /// The implementation uses `reserve_exact` to only allocate as much memory as required. While this
 /// saves memory for typical uses cases involving permutations, it can cause quadratic runtime when
 /// gorwing the degree of a permutation one at a time.
-impl<Pt: Point, const N: usize> StorePerm for SmallPerm<Pt, N> {
+// SAFETY: See `StorePerm`'s safety section for details
+unsafe impl<Pt: Point, const N: usize> StorePerm for SmallPerm<Pt, N> {
     type Point = Pt;
+    type Uninit = Self;
 
     #[inline]
-    fn build_from_perm_val(perm: impl PermVal<Pt>) -> Self
+    unsafe fn new_uninit_with_degree(degree: usize) -> Self::Uninit
     where
         Self: Sized,
     {
-        let degree = perm.degree();
-        let mut vec = SmallVec::<[Pt; N]>::with_capacity(degree);
+        Self {
+            vec: SmallVec::with_capacity(degree),
+        }
+    }
 
-        // SAFETY: `get_unchecked_mut` is in bounds as we reserved sufficient capacity, `set_len` is
-        // allowed as `PermVal` guarantees that `write_to_slice` writes a fully initialized valid
-        // permutation when the passed slice has the requested size.
-        // XXX reword above
+    #[inline]
+    unsafe fn prepare_new_uninit_with_degree(
+        uninit: &mut Self::Uninit,
+        degree: usize,
+    ) -> &mut MaybeUninitPerm<Self::Point>
+    where
+        Self: Sized,
+    {
+        // SAFETY: we used `with_capacity(degree)` above to allocate sufficient storage and
+        // `StorePerm` guarantees we get such a value in `uninit` and are called with matching
+        // `degree`. `StorePerm` also guarantees that `degree` does not exceed `Pt::MAX_DEGREE`.
         unsafe {
-            perm.write_to_slice(std::slice::from_raw_parts_mut(
-                vec.as_mut_ptr() as *mut MaybeUninit<Pt>,
+            MaybeUninitPerm::from_mut_slice_unchecked(std::slice::from_raw_parts_mut(
+                uninit.vec.as_mut_ptr() as *mut MaybeUninit<Pt>,
                 degree,
-            ));
-            vec.set_len(degree);
-        }
-
-        Self { vec }
-    }
-
-    #[inline]
-    fn assign_perm_val(&mut self, perm: impl PermVal<Pt>) {
-        let mut degree = perm.degree();
-
-        let new_degree = self.vec.len().max(degree);
-
-        self.vec.clear();
-        self.vec.reserve_exact(new_degree);
-
-        // SAFETY: `get_unchecked_mut` is in bounds as we reserved sufficient capacity, `set_len` is
-        // allowed as `PermVal` guarantees that `write_to_slice` writes a fully initialized valid
-        // permutation when the passed slice has the requested size. In the case that `new_degree >
-        // degree` the missing values are already initialized, but need to be overwritten as fixed
-        // points to maintain `SmallPerm`'s invariant.
-        unsafe {
-            // XXX reword
-            let data = std::slice::from_raw_parts_mut(
-                self.vec.as_mut_ptr() as *mut MaybeUninit<Pt>,
-                new_degree,
-            );
-
-            perm.write_to_slice(data.get_unchecked_mut(..degree));
-
-            for p in data.get_unchecked_mut(degree..) {
-                *p = MaybeUninit::new(Pt::from_index(degree));
-                degree += 1;
-            }
-
-            self.vec.set_len(new_degree);
+            ))
         }
     }
 
     #[inline]
-    fn build_from_perm_val_with_temp<V: PermValWithTemp<Self::Point>>(
-        perm: V,
-        temp: &mut V::Temp,
-    ) -> Self
+    unsafe fn assume_new_init(mut uninit: Self::Uninit, degree: usize) -> Self
     where
         Self: Sized,
     {
-        let degree = perm.degree();
-        let mut vec = SmallVec::<[Pt; N]>::with_capacity(degree);
-
-        // SAFETY: `get_unchecked_mut` is in bounds as we reserved sufficient capacity, `set_len` is
-        // allowed as `PermVal` guarantees that `write_to_slice` writes a fully initialized valid
-        // permutation when the passed slice has the requested size.
-        unsafe {
-            perm.write_to_slice_with_temp(
-                std::slice::from_raw_parts_mut(vec.as_mut_ptr() as *mut MaybeUninit<Pt>, degree),
-                temp,
-            );
-            vec.set_len(degree);
-        }
-
-        Self { vec }
+        // SAFETY: `StorePerm` guarantees that we prepared `uninit` with enough capacity and that it
+        // was subsequently initialized with a valid permutation
+        unsafe { uninit.vec.set_len(degree) };
+        uninit
     }
 
     #[inline]
-    fn assign_perm_val_with_temp<V: PermValWithTemp<Self::Point>>(
+    unsafe fn prepare_assign_with_degree(
         &mut self,
-        perm: V,
-        temp: &mut V::Temp,
-    ) {
-        let mut degree = perm.degree();
-
-        let new_degree = self.vec.len().max(degree);
-
+        degree: usize,
+    ) -> &mut super::raw::MaybeUninitPerm<Self::Point> {
         self.vec.clear();
-        self.vec.reserve_exact(new_degree);
+        self.vec.reserve_exact(degree);
+        // SAFETY: after clearing and reserving storage, the requirements here are the same as for
+        // `prepare_new_uninit_with_degree`.
+        unsafe { Self::prepare_new_uninit_with_degree(self, degree) }
+    }
 
-        // SAFETY: `get_unchecked_mut` is in bounds as we reserved sufficient capacity, `set_len` is
-        // allowed as `PermVal` guarantees that `write_to_slice` writes a fully initialized valid
-        // permutation when the passed slice has the requested size. In the case that `new_degree >
-        // degree` the missing values are already initialized, but need to be overwritten as fixed
-        // points to maintain `SmallPerm`'s invariant.
-        unsafe {
-            // XXX reword
-            let data = std::slice::from_raw_parts_mut(
-                self.vec.as_mut_ptr() as *mut MaybeUninit<Pt>,
-                new_degree,
-            );
-
-            perm.write_to_slice_with_temp(data.get_unchecked_mut(..degree), temp);
-
-            for p in data.get_unchecked_mut(degree..) {
-                *p = MaybeUninit::new(Pt::from_index(degree));
-                degree += 1;
-            }
-
-            self.vec.set_len(new_degree);
-        }
+    #[inline]
+    unsafe fn assume_assign_init(&mut self, degree: usize) {
+        // SAFETY: `StorePerm` guarantees that we prepared `self` with enough capacity and that it
+        // was subsequently initialized with a valid permutation
+        unsafe { self.vec.set_len(degree) };
     }
 }

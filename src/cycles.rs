@@ -4,7 +4,7 @@ use std::{
     convert::Infallible,
     fmt::{self, Write},
     marker::PhantomData,
-    mem::{replace, take, MaybeUninit},
+    mem::{replace, take},
     ops,
     str::FromStr,
 };
@@ -14,7 +14,10 @@ use smallvec::SmallVec;
 use crate::{
     gap,
     inplace::{Inplace, InplaceWithTemp},
-    perm::{Perm, PermVal},
+    perm::{
+        raw::{self, MaybeUninitPerm},
+        Perm, PermVal,
+    },
     point::Point,
 };
 
@@ -491,19 +494,14 @@ unsafe impl<Pt: Point> PermVal<Pt> for &Cycles<Pt> {
         self.degree
     }
 
-    unsafe fn write_to_slice(self, output: &mut [MaybeUninit<Pt>]) {
-        // SAFETY: completely initialize with the identity permutation
-        for (i, p) in output.iter_mut().enumerate() {
-            *p = MaybeUninit::new(Pt::from_index(i));
-        }
+    unsafe fn write_into(self, output: &mut MaybeUninitPerm<Pt>) {
+        let output = raw::write_identity(output);
 
-        // SAFETY: swapping elements to apply the cycles ensures we end up with a valid permutation
-        // even for improper cycles.
         for cycle in self.iter().rev() {
             let mut points = cycle.iter();
             if let Some(mut last) = points.next() {
                 for p in points {
-                    output.swap(p.index(), last.index());
+                    output.left_mul_transp_by_index(p.index(), last.index());
                     last = p;
                 }
             }

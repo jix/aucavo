@@ -156,7 +156,7 @@ pub trait InplaceWithTemp<Output: ?Sized, Choice>: Inplace<Output, Choice> {
 
 /// Bundles an in-place assignable result with temporary storage required to compute that result.
 ///
-/// See also [`Inplace::with_temp`] and [`InplaceWithTemp`].
+/// See also [`InplaceWithTemp::with_temp`] and [`InplaceWithTemp`].
 pub struct WithTemp<'a, I, T> {
     inplace: I,
     temp: &'a mut T,

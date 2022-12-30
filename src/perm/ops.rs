@@ -38,10 +38,8 @@ unsafe impl<Pt: Point> PermVal<Pt> for Inv<'_, Pt> {
     }
 
     #[inline]
-    unsafe fn write_to_slice(self, output: &mut [MaybeUninit<Pt>]) {
-        for (i, j) in self.0.as_slice().iter().enumerate() {
-            output[j.index()] = MaybeUninit::new(Pt::from_index(i));
-        }
+    unsafe fn write_into(self, output: &mut MaybeUninitPerm<Pt>) {
+        raw::write_inverse_same_degree(output, self.0);
     }
 }
 
@@ -77,11 +75,8 @@ unsafe impl<Pt: Point> PermVal<Pt> for Prod<'_, Pt> {
     }
 
     #[inline]
-    unsafe fn write_to_slice(self, output: &mut [MaybeUninit<Pt>]) {
-        // TODO optimized implementations
-        for (index, p) in output.iter_mut().enumerate() {
-            *p = MaybeUninit::new(self.right.image(self.left.image_of_index(index)));
-        }
+    unsafe fn write_into(self, output: &mut MaybeUninitPerm<Pt>) {
+        raw::write_product(output, self.left, self.right);
     }
 }
 
@@ -112,8 +107,9 @@ unsafe impl<Pt: Point> PermVal<Pt> for Pow<'_, Pt> {
     }
 
     #[inline]
-    unsafe fn write_to_slice(self, output: &mut [MaybeUninit<Pt>]) {
-        unsafe { self.write_to_slice_with_temp(output, &mut Default::default()) }
+    unsafe fn write_into(self, _output: &mut MaybeUninitPerm<Pt>) {
+        // unsafe { self.write_to_slice_with_temp(output, &mut Default::default()) }
+        todo!()
     }
 }
 
@@ -123,11 +119,14 @@ unsafe impl<Pt: Point> PermValWithTemp<Pt> for Pow<'_, Pt> {
     type Temp = SmallPerm<Pt, 128>;
 
     #[inline]
-    unsafe fn write_to_slice_with_temp(
+    unsafe fn write_into_with_temp(
         self,
-        output: &mut [MaybeUninit<Pt>],
-        temp: &mut Self::Temp,
+        _output: &mut MaybeUninitPerm<Pt>,
+        _temp: &mut Self::Temp,
     ) {
+        if self.exp != 0 {
+            todo!()
+        }
         todo!()
     }
 }

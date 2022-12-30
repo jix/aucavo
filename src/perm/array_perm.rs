@@ -13,9 +13,9 @@ use crate::{
     point::Point,
 };
 
-use super::iter::AllArrayPerms;
+use super::{iter::AllArrayPerms, raw::MaybeUninitPerm};
 
-use super::{Perm, PermVal, PermValWithTemp, StorePerm};
+use super::{Perm, StorePerm};
 
 /// Owned permutation backed by an array.
 ///
@@ -162,87 +162,56 @@ impl<Pt: Point, const N: usize> ArrayPerm<Pt, N> {
 }
 
 /// Panics when assigning a permutation with a larger degree than `N`.
-impl<Pt: Point, const N: usize> StorePerm for ArrayPerm<Pt, N> {
+// SAFETY: See `StorePerm`'s safety section for details
+unsafe impl<Pt: Point, const N: usize> StorePerm for ArrayPerm<Pt, N> {
     type Point = Pt;
+    type Uninit = MaybeUninit<[Pt; N]>;
 
     #[inline]
-    fn build_from_perm_val(perm: impl PermVal<Self::Point>) -> Self
+    unsafe fn new_uninit_with_degree(degree: usize) -> Self::Uninit
     where
         Self: Sized,
     {
-        // FUTURE: I expect this to require less/no unsafe in the future
-        let mut uninitialized: MaybeUninit<[Pt; N]> = MaybeUninit::uninit();
-        // SAFETY: `MaybeUninit<[Pt; N]>` is valid iff `[MaybeUninit<Pt>; N]` is and they have the
-        // same layout
-        let transposed = unsafe { &mut *(uninitialized.as_mut_ptr() as *mut [MaybeUninit<Pt>; N]) };
-
-        // We use that `split_at_mut` panics when the degree is too large
-        let mut degree = perm.degree();
-        let (new_perm, fixed_suffix) = transposed.split_at_mut(degree);
-
-        // SAFETY: `PermVal` guarantees that `write_to_slice` writes a fully initialized valid
-        // permutation when the passed slice has the requested size.
-        unsafe {
-            perm.write_to_slice(new_perm);
-        };
-
-        for p in fixed_suffix {
-            p.write(Pt::from_index(degree));
-            degree += 1;
-        }
-
-        Self {
-            // SAFETY: fully initialized above
-            array: unsafe { uninitialized.assume_init() },
-        }
+        assert!(N <= Pt::MAX_DEGREE);
+        assert!(degree <= N);
+        MaybeUninit::uninit()
     }
 
     #[inline]
-    fn assign_perm_val(&mut self, perm: impl PermVal<Self::Point>) {
-        self.deref_mut().assign_perm_val(perm);
-    }
-
-    #[inline]
-    fn build_from_perm_val_with_temp<V: PermValWithTemp<Self::Point>>(
-        perm: V,
-        temp: &mut V::Temp,
-    ) -> Self
+    unsafe fn prepare_new_uninit_with_degree(
+        uninit: &mut Self::Uninit,
+        degree: usize,
+    ) -> &mut MaybeUninitPerm<Self::Point>
     where
         Self: Sized,
     {
-        // FUTURE: I expect this to require less/no unsafe in the future
-        let mut uninitialized: MaybeUninit<[Pt; N]> = MaybeUninit::uninit();
-        // SAFETY: `MaybeUninit<[Pt; N]>` is valid iff `[MaybeUninit<Pt>; N]` is and they have the
-        // same layout
-        let transposed = unsafe { &mut *(uninitialized.as_mut_ptr() as *mut [MaybeUninit<Pt>; N]) };
+        MaybeUninitPerm::from_mut_array(uninit).pad_from_degree(degree)
+    }
 
-        // We use that `split_at_mut` panics when the degree is too large
-        let mut degree = perm.degree();
-        let (new_perm, fixed_suffix) = transposed.split_at_mut(degree);
-
-        // SAFETY: `PermVal` guarantees that `write_to_slice` writes a fully initialized valid
-        // permutation when the passed slice has the requested size.
+    #[inline]
+    unsafe fn assume_new_init(uninit: Self::Uninit, _degree: usize) -> Self
+    where
+        Self: Sized,
+    {
+        // SAFETY: `StorePerm` requires that `0..degree` was initialized, we initialized `degree..N`
+        // in `prepare_new_uninit_with_degree` via `pad_from_degree`.
         unsafe {
-            perm.write_to_slice_with_temp(new_perm, temp);
-        };
-
-        for p in fixed_suffix {
-            p.write(Pt::from_index(degree));
-            degree += 1;
-        }
-
-        Self {
-            // SAFETY: fully initialized above
-            array: unsafe { uninitialized.assume_init() },
+            Self {
+                array: uninit.assume_init(),
+            }
         }
     }
 
     #[inline]
-    fn assign_perm_val_with_temp<V: PermValWithTemp<Self::Point>>(
+    unsafe fn prepare_assign_with_degree(
         &mut self,
-        perm: V,
-        temp: &mut V::Temp,
-    ) {
-        self.deref_mut().assign_perm_val_with_temp(perm, temp);
+        degree: usize,
+    ) -> &mut super::raw::MaybeUninitPerm<Self::Point> {
+        assert!(N <= Pt::MAX_DEGREE);
+        assert!(degree <= N);
+        MaybeUninitPerm::from_init_mut_array::<N>(&mut self.array).pad_from_degree(degree)
     }
+
+    #[inline]
+    unsafe fn assume_assign_init(&mut self, _degree: usize) {}
 }

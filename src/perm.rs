@@ -10,10 +10,11 @@ use crate::{
     point::{Point, PointIter, PointRange},
 };
 
-use self::iter::Iter;
+use self::{iter::Iter, raw::MaybeUninitPerm};
 
 pub mod iter;
 pub mod ops;
+pub mod raw;
 
 mod array_perm;
 mod small_perm;
@@ -23,12 +24,37 @@ pub use array_perm::ArrayPerm;
 pub use small_perm::SmallPerm;
 pub use vec_perm::VecPerm;
 
-/// A permutation.
-#[repr(transparent)]
-pub struct Perm<Pt: Point> {
-    // SAFETY: must always be a valid permutation.
-    slice: [Pt],
+// SAFETY: Limit amount of code that can access fields with safety invariants
+mod field_safety {
+    use super::*;
+    /// A permutation.
+    #[repr(transparent)]
+    pub struct Perm<Pt: Point> {
+        // SAFETY: must always be a valid permutation.
+        slice: [Pt],
+    }
+
+    impl<Pt: Point> Perm<Pt> {
+        /// Returns the slice containing the images of `self.domain()`.
+        #[inline(always)]
+        pub fn as_slice(&self) -> &[Pt] {
+            &self.slice
+        }
+
+        /// Returns the mutable slice containing the images of `self.domain()`.
+        ///
+        /// # Safety
+        /// A `Perm` must always be a valid permutation and users may depend on this for memory safety.
+        /// The user of this method has to ensure this invariant is maintained, even in the present of
+        /// panics.
+        #[inline(always)]
+        pub unsafe fn as_mut_slice(&mut self) -> &mut [Pt] {
+            &mut self.slice
+        }
+    }
 }
+
+pub use field_safety::Perm;
 
 impl<Pt: Point> Perm<Pt> {
     /// The identity permutation.
@@ -111,32 +137,15 @@ impl<Pt: Point> Perm<Pt> {
         ops::Parse::gap(s)
     }
 
-    /// Returns the slice containing the images of `self.domain()`.
-    #[inline]
-    pub fn as_slice(&self) -> &[Pt] {
-        &self.slice
-    }
-
-    /// Returns the mutable slice containing the images of `self.domain()`.
-    ///
-    /// # Safety
-    /// A `Perm` must always be a valid permutation and users may depend on this for memory safety.
-    /// The user of this method has to ensure this invariant is maintained, even in the present of
-    /// panics.
-    #[inline]
-    pub unsafe fn as_mut_slice(&mut self) -> &mut [Pt] {
-        &mut self.slice
-    }
-
     /// Returns the size of the set the permutation acts on.
     ///
     /// A `Perm` acts on the set `0..self.degree()`.
     ///
     /// Unless documented otherwise, a smaller degree permutation is implicitly extended by adding
     /// fixed points when a larger degree permutation is expected.
-    #[inline]
+    #[inline(always)]
     pub fn degree(&self) -> usize {
-        self.slice.len()
+        self.as_slice().len()
     }
 
     /// Returns the image of a point under the permutation.
@@ -156,9 +165,9 @@ impl<Pt: Point> Perm<Pt> {
         // simpler to optimize unsafe version instead. When I'm confident that a current rustc/llvm
         // won't generate silly code for this in any call site this might be inlined into, I will
         // change this.
-        if index < self.slice.len() {
+        if index < self.degree() {
             // SAFETY: if condition is the exact required bound check
-            unsafe { *self.slice.get_unchecked(index) }
+            unsafe { *self.as_slice().get_unchecked(index) }
         } else {
             Pt::from_index(index)
         }
@@ -207,7 +216,7 @@ impl<Pt: Point> Perm<Pt> {
 
     #[inline]
     fn shrink_to_degree(&self, degree: usize) -> &Self {
-        let mut shrunk = &self.slice;
+        let mut shrunk = self.as_slice();
         while shrunk.len() > degree {
             if let Some((&last, rest)) = shrunk.split_last() {
                 if last.index() != rest.len() {
@@ -240,9 +249,10 @@ impl<Pt: Point> Perm<Pt> {
         ops::Prod::new(self, other)
     }
 
+    /// Returns the `n`-th power of this permutation.
     #[inline]
-    pub fn pow(&self, exp: isize) -> ops::Pow<Pt> {
-        ops::Pow::new(self, exp)
+    pub fn pow(&self, n: isize) -> ops::Pow<Pt> {
+        ops::Pow::new(self, n)
     }
 
     /// Advances to the lexicographically next permutation.
@@ -251,10 +261,15 @@ impl<Pt: Point> Perm<Pt> {
     /// resets to the identity permutation (lexicographically first) when called on the
     /// lexciographically last permutation.
     pub fn lexicographical_next(&mut self) -> bool {
-        let mut right_to_left = self.slice.iter().copied().enumerate().rev();
-        let Some((_, mut prev)) = right_to_left.next() else { return false };
+        // SAFETY: this only uses swap and reverse to modify the slice of points, thus it maintains
+        // a valid permutation
+        unsafe {
+            let slice = self.as_mut_slice();
 
-        let Some((a, a_image)) = right_to_left.find(|&(_, current)| {
+            let mut right_to_left = slice.iter().copied().enumerate().rev();
+            let Some((_, mut prev)) = right_to_left.next() else { return false };
+
+            let Some((a, a_image)) = right_to_left.find(|&(_, current)| {
             let found = current < prev;
             prev = current;
             found
@@ -263,11 +278,24 @@ impl<Pt: Point> Perm<Pt> {
             return false;
         };
 
-        let b = a + 1 + self.slice[a + 2..].partition_point(|&b_image| b_image > a_image);
+            let b = a + 1 + slice[a + 2..].partition_point(|&b_image| b_image > a_image);
 
-        self.slice.swap(a, b);
-        self.slice[a + 1..].reverse();
-        true
+            slice.swap(a, b);
+            slice[a + 1..].reverse();
+            true
+        }
+    }
+
+    /// Left multiplies a transposition of two points given by their indices.
+    ///
+    /// When either index is at or above the degree, this panics and will not extend the degree of
+    /// the permutation.
+    ///
+    /// This specific operation corresponds to exchanging two points in the slice used to represent
+    /// this permutation. Taking the points as indices avoids a roundtrip through the `Pt` type.
+    pub fn left_mul_transp_by_index(&mut self, a: usize, b: usize) {
+        // SAFETY: exchanging two points maintains validity of a permutation
+        unsafe { self.as_mut_slice().swap(a, b) };
     }
 }
 
@@ -373,56 +401,160 @@ impl<Pt: Point> Perm<Pt> {
 
 /// Types that can store a permutation.
 ///
-/// Implementing this trait allows storing [`PermVal`]s in the implementing type via the blanket
-/// impl of [`Inplace`] that delegates to [`PermVal`].
+/// As a user, there is usually no need to use nor to implement this trait. This trait is the unsafe
+/// low level interface implemented for [`Perm`] storing type like [`VecPerm`], [`ArrayPerm`], etc.
+/// It makes it possible to assign permutations to values of these type or to obtain new values of
+/// this type from a permutation.
+///
+/// Operations that produce such permutations do not use this trait directly, instead they implement
+/// [`PermVal`] and rely on an [`Inplace`] instance that enables assigning [`PermVal`]s to
+/// [`StorePerm`]s or building new [`StorePerm`]s from [`PermVal`]s.
 ///
 /// # Safety
-/// Implementers should make sure to consider the safety requirements of [`PermVal`].
-pub trait StorePerm {
+///
+/// The following sequence must be safe for any implementing type `O` of this trait:
+///
+/// ```no_run
+/// # use aucavo::{point::Point, perm::*};
+///
+/// fn overwrite<O: StorePerm>(t: &mut O, degree: usize) {
+///     unsafe {
+///         assert!(degree <= O::Point::MAX_DEGREE);
+///         let target = t.prepare_assign_with_degree(degree);
+///         init(target, degree);
+///         t.assume_assign_init(degree);
+///     }
+/// }
+///
+/// unsafe fn init<Pt: Point>(target: &mut raw::MaybeUninitPerm<Pt>, degree: usize) {
+/// #    raw::write_identity(target);
+///     // See below for details
+/// }
+/// ```
+///
+/// Here `O` may rely on `degree <= O::Point::MAX_DEGREE`. When `prepare_assign_with_degree` does
+/// not panic, it must return a [`MaybeUninitPerm`] value of the requested degree and `init` may
+/// rely on this for safety. When `init` does not panic, it must have initialized `target` with a
+/// valid permutation. When `init` does panic, it may do so a) before writing anything to `target`
+/// or b) after having overwritten `target` with a valid permutation. It may never read from
+/// `target`, nor write uninitialized data to `target`, nor panic with a partially overwritten or
+/// otherwise non-permutation `target`. Finally `assume_assign_init` may assume that the parameter
+/// has the same value previously passed to `prepare_assign_with_degree`.
+///
+/// For types `O: Sized` the following additional sequence must be safe:
+///
+/// ```no_run
+/// # use aucavo::{point::Point, perm::*};
+///
+/// fn overwrite<O: StorePerm>(degree: usize) -> O {
+///     unsafe {
+///         assert!(degree <= O::Point::MAX_DEGREE);
+///         let mut u = O::new_uninit_with_degree(degree);
+///         let target = O::prepare_new_uninit_with_degree(&mut u, degree);
+///         init(target, degree);
+///         O::assume_new_init(u, degree)
+///     }
+/// }
+///
+/// unsafe fn init<Pt: Point>(target: &mut raw::MaybeUninitPerm<Pt>, degree: usize) {
+/// #    raw::write_identity(target);
+///     // See below for details
+/// }
+/// ```
+///
+/// Here `O` may rely on `degree <= O::Point::MAX_DEGREE`. Here `prepare_new_uninit_with_degree` may
+/// assume that the `degree` parameter has the same value previously passed to
+/// `new_uninit_with_degree`.  When `prepare_new_uninit_with_degree` does not panic, it must return
+/// a [`MaybeUninitPerm`] value of the requested degree and `init` may rely on this for safety. When
+/// `init` does not panic, it must have initialized `target` with a valid permutation. When `init`
+/// does panic, it may do so a) before writing anything to `target` or b) after having overwritten
+/// `target` with a valid permutation. It may never read from `target`, nor write uninitialized data
+/// to `target`, nor panic with a partially overwritten or otherwise non-permutation `target`.
+/// Finally `assume_new_init` may assume that the `degree` parameter has the same value previously
+/// passed to `new_uninit_with_degree` and to `prepare_new_uninit_with_degree`.
+///
+/// Users of this trait may only invoke the methods following either of these two call sequences.
+pub unsafe trait StorePerm {
     /// Point representation used.
     type Point: Point;
+    /// Type for an uninitialized value.
+    type Uninit;
 
-    /// Returns a new value storing the given permutation.
+    /// Builds a new uninitialized value, preparing to store a permutation of the given degree.
     ///
-    /// Not available for unsized types.
-    ///
-    /// Callers should use the blanket implementation of [`Inplace`] instead of calling this
-    /// directly.
-    fn build_from_perm_val(perm: impl PermVal<Self::Point>) -> Self
+    /// # Safety
+    /// See [`StorePerm`] for a complete description.
+    unsafe fn new_uninit_with_degree(degree: usize) -> Self::Uninit
     where
         Self: Sized;
 
-    /// Assign the given permutation to a value in-place.
+    /// Prepares the uninitialized value for writing a permutation of the given degree.
     ///
-    /// An implementation can chose to automatically grow its storage when assigning a permutation
-    /// of a larger degree than the previously stored permutation. Alternatively it is allowed to
-    /// panic. Implementations are expected to document their degree-growing behavior.
-    ///
-    /// Callers should use the blanket implementation of [`Inplace`] instead of calling this
-    /// directly.
-    fn assign_perm_val(&mut self, perm: impl PermVal<Self::Point>);
-
-    fn build_from_perm_val_with_temp<V: PermValWithTemp<Self::Point>>(
-        perm: V,
-        temp: &mut V::Temp,
-    ) -> Self
+    /// # Safety
+    /// See [`StorePerm`]  for a complete description. Implementations may expect `degree` to be
+    /// the same value provided for `new_uninit_with_degree` and have to return a value of that
+    /// degree.
+    unsafe fn prepare_new_uninit_with_degree(
+        uninit: &mut Self::Uninit,
+        degree: usize,
+    ) -> &mut MaybeUninitPerm<Self::Point>
     where
         Self: Sized;
 
-    fn assign_perm_val_with_temp<V: PermValWithTemp<Self::Point>>(
+    /// Returns an initialized value after a permutation was written to it.
+    ///
+    /// # Safety
+    /// See [`StorePerm`] for a complete description. Implementations may expect `degree` to be the
+    /// same value provided for `new_uninit_with_degree` and `prepare_new_uninit_with_degree`.
+    /// Implementations may also assume that the permutation was initialized before this was called.
+    /// Implementation have to ensure that a panic before reaching this point is safe.
+    unsafe fn assume_new_init(uninit: Self::Uninit, degree: usize) -> Self
+    where
+        Self: Sized;
+
+    /// Prepares an existing value for assigning a new permutation of the given degree.
+    ///
+    /// # Safety
+    /// See [`StorePerm`]  for a complete description.
+    unsafe fn prepare_assign_with_degree(
         &mut self,
-        perm: V,
-        temp: &mut V::Temp,
-    );
+        degree: usize,
+    ) -> &mut MaybeUninitPerm<Self::Point>;
 
-    // TODO unchecked/checked methods for assignment with matching degree?
-    // TODO consts and/or subtraits indiciating the growing behavior?
+    /// Finalizes a value after it was overwritten with a permutation of the given degree.
+    ///
+    /// # Safety
+    /// See [`StorePerm`] for a complete description. Implementations may expect `degree` to be the
+    /// same value provided for `prepare_assign_with_degree`. Implementations may also assume that
+    /// the permutation was initialized before this was called. Implementation have to ensure that a
+    /// panic before reaching this point is safe.
+    unsafe fn assume_assign_init(&mut self, degree: usize);
 }
 
 /// Panics when assigning a permutation with a larger degree than the existing value.
-impl<Pt: Point> StorePerm for Perm<Pt> {
+// SAFETY: See `StorePerm`'s safety section for details
+unsafe impl<Pt: Point> StorePerm for Perm<Pt> {
     type Point = Pt;
-    fn build_from_perm_val(_perm: impl PermVal<Pt>) -> Self
+    type Uninit = MaybeUninit<Pt>;
+
+    unsafe fn new_uninit_with_degree(_degree: usize) -> Self::Uninit
+    where
+        Self: Sized,
+    {
+        unreachable!()
+    }
+
+    unsafe fn prepare_new_uninit_with_degree(
+        _uninit: &mut Self::Uninit,
+        _degree: usize,
+    ) -> &mut MaybeUninitPerm<Self::Point>
+    where
+        Self: Sized,
+    {
+        unreachable!()
+    }
+
+    unsafe fn assume_new_init(_uninit: Self::Uninit, _degree: usize) -> Self
     where
         Self: Sized,
     {
@@ -430,96 +562,63 @@ impl<Pt: Point> StorePerm for Perm<Pt> {
     }
 
     #[inline]
-    fn assign_perm_val(&mut self, perm: impl PermVal<Pt>) {
-        let mut degree = perm.degree();
-
-        // We use that `split_at_mut` panics when the degree is too large
-        let (new_perm, fixed_suffix) = self.slice.split_at_mut(degree);
-
-        // SAFETY: `PermVal` guarantees that `write_to_slice` writes a fully initialized valid
-        // permutation when the passed slice has the requested size.
-        unsafe {
-            let new_perm: &mut [MaybeUninit<Pt>] =
-                &mut *(new_perm as *mut [Pt] as *mut [MaybeUninit<Pt>]);
-            perm.write_to_slice(new_perm);
-        };
-
-        for p in fixed_suffix {
-            *p = Pt::from_index(degree);
-            degree += 1;
-        }
-    }
-
-    fn build_from_perm_val_with_temp<V: PermValWithTemp<Self::Point>>(
-        _perm: V,
-        _temp: &mut V::Temp,
-    ) -> Self
-    where
-        Self: Sized,
-    {
-        unreachable!()
-    }
-
-    #[inline]
-    fn assign_perm_val_with_temp<V: PermValWithTemp<Self::Point>>(
+    unsafe fn prepare_assign_with_degree(
         &mut self,
-        perm: V,
-        temp: &mut V::Temp,
-    ) {
-        let mut degree = perm.degree();
-
-        // We use that `split_at_mut` panics when the degree is too large
-        let (new_perm, fixed_suffix) = self.slice.split_at_mut(degree);
-
-        // SAFETY: `PermVal` guarantees that `write_to_slice` writes a fully initialized valid
-        // permutation when the passed slice has the requested size.
-        unsafe {
-            let new_perm: &mut [MaybeUninit<Pt>] =
-                &mut *(new_perm as *mut [Pt] as *mut [MaybeUninit<Pt>]);
-            perm.write_to_slice_with_temp(new_perm, temp);
-        };
-
-        for p in fixed_suffix {
-            *p = Pt::from_index(degree);
-            degree += 1;
-        }
+        degree: usize,
+    ) -> &mut MaybeUninitPerm<Self::Point> {
+        assert!(degree <= self.degree());
+        // SAFETY: Both `StorePerm` and the assert guarantee `self.slice.len() <= Pt::MAX_DEGREE`
+        unsafe { MaybeUninitPerm::from_init_mut_slice_unchecked(self.as_mut_slice()) }
+            .pad_from_degree(degree)
     }
+
+    #[inline]
+    unsafe fn assume_assign_init(&mut self, _degree: usize) {}
 }
 
-impl<T: ?Sized> StorePerm for &mut T
+// SAFETY: See `StorePerm`'s safety section for details
+unsafe impl<T: ?Sized> StorePerm for &mut T
 where
     T: StorePerm,
 {
     type Point = T::Point;
-    fn build_from_perm_val(_perm: impl PermVal<Self::Point>) -> Self
+    type Uninit = T::Uninit;
+
+    unsafe fn new_uninit_with_degree(_degree: usize) -> Self::Uninit
     where
         Self: Sized,
     {
         unreachable!()
     }
 
-    #[inline]
-    fn assign_perm_val(&mut self, perm: impl PermVal<Self::Point>) {
-        T::assign_perm_val(self, perm)
-    }
-
-    fn build_from_perm_val_with_temp<V: PermValWithTemp<Self::Point>>(
-        _perm: V,
-        _temp: &mut V::Temp,
-    ) -> Self
+    unsafe fn prepare_new_uninit_with_degree(
+        _uninit: &mut Self::Uninit,
+        _degree: usize,
+    ) -> &mut MaybeUninitPerm<Self::Point>
     where
         Self: Sized,
     {
         unreachable!()
     }
 
-    #[inline]
-    fn assign_perm_val_with_temp<V: PermValWithTemp<Self::Point>>(
+    unsafe fn assume_new_init(_uninit: Self::Uninit, _degree: usize) -> Self
+    where
+        Self: Sized,
+    {
+        unreachable!()
+    }
+
+    unsafe fn prepare_assign_with_degree(
         &mut self,
-        perm: V,
-        temp: &mut V::Temp,
-    ) {
-        T::assign_perm_val_with_temp(self, perm, temp)
+        degree: usize,
+    ) -> &mut MaybeUninitPerm<Self::Point> {
+        // SAFETY: forwarding to an implementation with the same safety requirements
+        unsafe { T::prepare_assign_with_degree(self, degree) }
+    }
+
+    unsafe fn assume_assign_init(&mut self, degree: usize) {
+        // SAFETY: forwarding to an implementation with the same safety requirements
+        unsafe { T::assume_assign_init(self, degree) }
     }
 }
 
@@ -531,15 +630,12 @@ where
 /// trait that is also implemented by such operation-specific types.
 ///
 /// Using this trait directly is only required when implementing new low-level permutation producing
-/// operations or when implementing [`StorePerm`] for a new type.
-///
-/// When implementing `PermVal` for a type, usually that should be accompanied by an implementation
-/// of [`Inplace<O>`] for any [`O: StorePerm`][`StorePerm`].
+/// operations.
 ///
 /// # Safety
 /// Implementations must uphold the documented safety requirements for both
-/// [`degree`][`Self::degree`] as well as [`write_to_slice`][`Self::write_to_slice`], as callers do
-/// rely on them for safety.
+/// [`degree`][`Self::degree`] as well as [`write_into`][`Self::write_into`], as callers do rely
+/// on them for safety.
 pub unsafe trait PermVal<Pt: Point>: Sized {
     /// Returns the size of the set the permutation acts on.
     ///
@@ -547,22 +643,36 @@ pub unsafe trait PermVal<Pt: Point>: Sized {
     ///
     /// # Safety
     /// Calling this repeatedly must always return the same value. Implementations of
-    /// [`write_to_slice`][`Self::write_to_slice`] may require the passed `output` slice of this
-    /// length.
+    /// [`write_into`][`Self::write_into`] may require the passed `target` to have this degree.
     fn degree(&self) -> usize;
 
-    /// Writes a permutation to the provided slice.
+    /// Writes a permutation to a potentially uninitialized target.
     ///
     /// # Safety
-    /// Callers must provide a slice having the length returned by [`degree`][`Self::degree`].
-    /// Implementations may not read the existing contents of the slice and must overwrite it
-    /// completely with a valid permutation.
-    unsafe fn write_to_slice(self, output: &mut [MaybeUninit<Pt>]);
+    /// Callers must provide a target having the degree retrurned by [`degree`][`Self::degree`].
+    /// Implementations may not read from `target` and must fully initialize it with a valid
+    /// permutation and/or panic. When implementations panic `target` must either be left in its
+    /// original state or have been completely overwritten with a valid permutation.
+    unsafe fn write_into(self, target: &mut MaybeUninitPerm<Pt>);
 }
 
+/// Values representing a permutation whose computation requires temporary storage.
+///
+/// # Safety
+/// Implementations must uphold the documented safety requirements of [`PermVal`] and
+/// [`write_into_with_temp`][`Self::write_into_with_temp`].
 pub unsafe trait PermValWithTemp<Pt: Point>: PermVal<Pt> {
+    /// Type used to store temporary data.
     type Temp: Default;
-    unsafe fn write_to_slice_with_temp(self, output: &mut [MaybeUninit<Pt>], temp: &mut Self::Temp);
+
+    /// Writes a permutation to a potentially uninitialized target using provided temporary storage.
+    ///
+    /// # Safety
+    /// Callers must provide a target having the degree retrurned by [`degree`][`PermVal::degree`].
+    /// Implementations may not read from `target` and must fully initialize it with a valid
+    /// permutation and/or panic. When implementations panic `target` must either be left in its
+    /// original state or have been completely overwritten with a valid permutation.
+    unsafe fn write_into_with_temp(self, output: &mut MaybeUninitPerm<Pt>, temp: &mut Self::Temp);
 }
 
 /// Disambiguator for the [`Inplace`] impl assigning [`PermVal`]s to [`StorePerm`]s.
@@ -579,12 +689,25 @@ where
     where
         O: Sized,
     {
-        Ok(O::build_from_perm_val(self))
+        // SAFETY: As described in [`StorePerm`]'s safety section
+        unsafe {
+            let degree = self.degree();
+            let mut uninit = O::new_uninit_with_degree(degree);
+            let target = O::prepare_new_uninit_with_degree(&mut uninit, degree);
+            self.write_into(target);
+            Ok(O::assume_new_init(uninit, degree))
+        }
     }
 
     #[inline]
     fn try_assign_to(self, output: &mut O) -> Result<(), Self::Err> {
-        O::assign_perm_val(output, self);
+        // SAFETY: As described in [`StorePerm`]'s safety section
+        unsafe {
+            let degree = self.degree();
+            let target = output.prepare_assign_with_degree(degree);
+            self.write_into(target);
+            output.assume_assign_init(degree);
+        }
         Ok(())
     }
 }
@@ -600,7 +723,14 @@ where
     where
         O: Sized,
     {
-        Ok(O::build_from_perm_val_with_temp(self, temp))
+        // SAFETY: As described in [`StorePerm`]'s safety section
+        unsafe {
+            let degree = self.degree();
+            let mut uninit = O::new_uninit_with_degree(degree);
+            let target = O::prepare_new_uninit_with_degree(&mut uninit, degree);
+            self.write_into_with_temp(target, temp);
+            Ok(O::assume_new_init(uninit, degree))
+        }
     }
 
     #[inline]
@@ -609,7 +739,13 @@ where
         output: &mut O,
         temp: &mut Self::Temp,
     ) -> Result<(), Self::Err> {
-        O::assign_perm_val_with_temp(output, self, temp);
+        // SAFETY: As described in [`StorePerm`]'s safety section
+        unsafe {
+            let degree = self.degree();
+            let target = output.prepare_assign_with_degree(degree);
+            self.write_into_with_temp(target, temp);
+            output.assume_assign_init(degree);
+        }
         Ok(())
     }
 }
@@ -623,12 +759,8 @@ unsafe impl<Pt: Point> PermVal<Pt> for &Perm<Pt> {
     }
 
     #[inline]
-    unsafe fn write_to_slice(self, output: &mut [MaybeUninit<Pt>]) {
-        let slice: &[MaybeUninit<Pt>] =
-            // SAFETY: safe cast of &[Pt] to &[MaybeUninit<Pt>]
-            // FUTURE: Use a safe alternative when available (e.g. #79995)
-            unsafe { &*(self.as_slice() as *const [Pt] as *const [MaybeUninit<Pt>]) };
-        output.copy_from_slice(slice);
+    unsafe fn write_into(self, output: &mut MaybeUninitPerm<Pt>) {
+        raw::write_copy_same_degree(output, self);
     }
 }
 
@@ -641,10 +773,10 @@ unsafe impl<Pt: Point> PermVal<Pt> for &mut Perm<Pt> {
     }
 
     #[inline]
-    unsafe fn write_to_slice(self, output: &mut [MaybeUninit<Pt>]) {
+    unsafe fn write_into(self, output: &mut MaybeUninitPerm<Pt>) {
         // SAFETY: forwarding to `&Perm<Pt>`'s implementation upholds all safety requirements on both
         // the implementation and the call site.
-        unsafe { (self as &Perm<Pt>).write_to_slice(output) }
+        unsafe { (self as &Perm<Pt>).write_into(output) }
     }
 }
 
