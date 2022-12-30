@@ -6,12 +6,14 @@ use std::{
     fmt, hash,
     mem::MaybeUninit,
     ops::{Deref, DerefMut, Range},
+    str::FromStr,
 };
 
 use smallvec::{smallvec, SmallVec};
 
 use crate::{
-    cycles::CycleDecomposition,
+    cycles::{self, CycleDecomposition},
+    gap,
     inplace::{AssignInplace, Inplace},
     point::{Point, PointIter, PointRange},
 };
@@ -95,6 +97,18 @@ impl<Pt: Point> Perm<Pt> {
     pub unsafe fn from_mut_slice_unchecked(slice: &mut [Pt]) -> &mut Self {
         // SAFETY: `Self` is a `repr(transparent)` wrapper for `[Pt]`
         unsafe { &mut *(slice as *mut [Pt] as *mut Self) }
+    }
+
+    /// Parses a permutation from a string containing a cycle decomposition.
+    #[inline]
+    pub fn parse(s: &(impl AsRef<[u8]> + ?Sized)) -> ops::Parse<Pt> {
+        ops::Parse::new(s)
+    }
+
+    /// Parses a permutation from a string containing a cycle decomposition using GAP syntax.
+    #[inline]
+    pub fn parse_gap(s: &(impl AsRef<[u8]> + ?Sized)) -> ops::Parse<Pt> {
+        ops::Parse::gap(s)
     }
 
     /// Returns the slice containing the images of `self.domain()`.
@@ -258,6 +272,12 @@ impl<Pt: Point> fmt::Display for Perm<Pt> {
     }
 }
 
+impl<Pt: Point> gap::FmtGap for Perm<Pt> {
+    fn fmt_gap(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+        self.cycles().build().fmt_gap(f)
+    }
+}
+
 impl<Pt: Point> fmt::Debug for Perm<Pt> {
     fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
         write!(f, "{} @ 0..{}", self, self.degree())
@@ -379,9 +399,31 @@ impl<Pt: Point> fmt::Display for VecPerm<Pt> {
     }
 }
 
+impl<Pt: Point> gap::FmtGap for VecPerm<Pt> {
+    fn fmt_gap(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+        self.deref().fmt_gap(f)
+    }
+}
+
 impl<Pt: Point> fmt::Debug for VecPerm<Pt> {
     fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
         fmt::Debug::fmt(self.deref(), f)
+    }
+}
+
+impl<Pt: Point> FromStr for VecPerm<Pt> {
+    type Err = cycles::ParseError;
+
+    fn from_str(s: &str) -> Result<Self, Self::Err> {
+        Perm::parse(s).try_build()
+    }
+}
+
+impl<Pt: Point> gap::FromGapStr for VecPerm<Pt> {
+    type Err = cycles::ParseError;
+
+    fn from_gap_str(s: &str) -> Result<Self, Self::Err> {
+        Perm::parse_gap(s).try_build()
     }
 }
 
@@ -496,9 +538,31 @@ impl<Pt: Point, const N: usize> fmt::Display for ArrayPerm<Pt, N> {
     }
 }
 
+impl<Pt: Point, const N: usize> gap::FmtGap for ArrayPerm<Pt, N> {
+    fn fmt_gap(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+        self.deref().fmt_gap(f)
+    }
+}
+
 impl<Pt: Point, const N: usize> fmt::Debug for ArrayPerm<Pt, N> {
     fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
         fmt::Debug::fmt(self.deref(), f)
+    }
+}
+
+impl<Pt: Point, const N: usize> FromStr for ArrayPerm<Pt, N> {
+    type Err = cycles::ParseError;
+
+    fn from_str(s: &str) -> Result<Self, Self::Err> {
+        Perm::parse(s).try_build()
+    }
+}
+
+impl<Pt: Point, const N: usize> gap::FromGapStr for ArrayPerm<Pt, N> {
+    type Err = cycles::ParseError;
+
+    fn from_gap_str(s: &str) -> Result<Self, Self::Err> {
+        Perm::parse_gap(s).try_build()
     }
 }
 
@@ -849,6 +913,37 @@ mod tests {
 
         for pairs in perms.windows(2) {
             assert!(pairs[0] < pairs[1]);
+        }
+    }
+
+    #[test]
+    fn parse_mut_perm() {
+        let mut g: ArrayPerm<u8, 5> = Default::default();
+        let g: &mut Perm<u8> = &mut g;
+
+        for h in ArrayPerm::<u8, 5>::all() {
+            g.try_assign(Perm::parse(&h.to_string())).unwrap();
+            assert_eq!(*g, h);
+        }
+    }
+
+    #[test]
+    fn parse_vec_perm() {
+        let mut g: VecPerm<u8> = Default::default();
+
+        for h in ArrayPerm::<u8, 5>::all() {
+            g.try_assign(Perm::parse(&h.to_string())).unwrap();
+            assert_eq!(g, h);
+        }
+    }
+
+    #[test]
+    fn parse_array_perm() {
+        let mut g: ArrayPerm<u8, 5> = Default::default();
+
+        for h in ArrayPerm::<u8, 5>::all() {
+            g.try_assign(Perm::parse(&h.to_string())).unwrap();
+            assert_eq!(g, h);
         }
     }
 }

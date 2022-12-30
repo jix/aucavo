@@ -8,6 +8,7 @@
 #![allow(clippy::comparison_chain)]
 
 pub mod cycles;
+pub mod gap;
 pub mod inplace;
 pub mod perm;
 pub mod point;

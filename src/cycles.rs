@@ -4,12 +4,15 @@ use std::{
     convert::Infallible,
     fmt::{self, Write},
     marker::PhantomData,
-    mem::{replace, MaybeUninit},
+    mem::{replace, take, MaybeUninit},
+    ops,
+    str::FromStr,
 };
 
 use smallvec::SmallVec;
 
 use crate::{
+    gap,
     inplace::{Inplace, InplaceWithTemp},
     perm::{Perm, PermVal},
     point::Point,
@@ -139,7 +142,7 @@ impl<Pt: Point> Cycles<Pt> {
     pub fn parse(s: &(impl AsRef<[u8]> + ?Sized)) -> Parse<Pt> {
         Parse {
             bytes: s.as_ref(),
-            check: false,
+            mode: ParseMode::Relaxed,
             _phantom: PhantomData,
         }
     }
@@ -152,7 +155,20 @@ impl<Pt: Point> Cycles<Pt> {
     pub fn parse_decomposition(s: &(impl AsRef<[u8]> + ?Sized)) -> Parse<Pt> {
         Parse {
             bytes: s.as_ref(),
-            check: true,
+            mode: ParseMode::Decomposition,
+            _phantom: PhantomData,
+        }
+    }
+
+    /// Parses a permutation using the GAP syntax.
+    ///
+    /// Like [`parse_decomposition`][`Self::parse_decomposition`], but using commas (`','`) between
+    /// points in a cycle and using 1-based indexing for points.
+    #[inline]
+    pub fn parse_gap(s: &(impl AsRef<[u8]> + ?Sized)) -> Parse<Pt> {
+        Parse {
+            bytes: s.as_ref(),
+            mode: ParseMode::Gap,
             _phantom: PhantomData,
         }
     }
@@ -169,10 +185,16 @@ impl<'a, Pt: Point> IntoIterator for &'a Cycles<Pt> {
     }
 }
 
+enum ParseMode {
+    Relaxed,
+    Decomposition,
+    Gap,
+}
+
 /// [`Inplace`] operation implementing [`Cycles::parse`] and [`Cycles::parse_decomposition`].
 pub struct Parse<'a, Pt: Point> {
     bytes: &'a [u8],
-    check: bool,
+    mode: ParseMode,
     _phantom: PhantomData<Pt>,
 }
 
@@ -180,11 +202,47 @@ pub struct Parse<'a, Pt: Point> {
 #[derive(Debug)]
 pub struct ParseError {
     kind: ParseErrorKind,
+    bytes_left: usize,
+}
+
+impl ParseError {
+    fn unexpected(bytes: &[u8]) -> Self {
+        Self {
+            kind: if bytes.is_empty() {
+                ParseErrorKind::UnexepctedEnd
+            } else {
+                ParseErrorKind::UnexpectedCharacter
+            },
+            bytes_left: bytes.len(),
+        }
+    }
+
+    /// Number of input bytes following the error position
+    pub fn bytes_left(&self) -> usize {
+        self.bytes_left
+    }
+
+    /// Splits the input string or byte slice at the error position
+    ///
+    /// This can panic with out of bounds indexing when the `input` parameter does not match the
+    /// input passed to the parsing function.
+    pub fn split_input_on_error<'a, T>(&self, input: &'a T) -> (&'a T, &'a T)
+    where
+        T: AsRef<[u8]>,
+        T: ops::Index<ops::RangeTo<usize>, Output = T>,
+        T: ops::Index<ops::RangeFrom<usize>, Output = T>,
+    {
+        let len = input.as_ref().len();
+        let pos = len - self.bytes_left;
+        (&input[..pos], &input[pos..])
+    }
 }
 
 #[derive(Debug)]
 enum ParseErrorKind {
     UnexpectedCharacter,
+    UnexepctedEnd,
+    TrailingData,
     InvalidPoint,
     RepeatedPoint,
 }
@@ -194,7 +252,9 @@ impl std::error::Error for ParseError {}
 impl fmt::Display for ParseError {
     fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
         match self.kind {
-            ParseErrorKind::UnexpectedCharacter => write!(f, "unexpected character in permutation"),
+            ParseErrorKind::UnexpectedCharacter => write!(f, "unexpected character"),
+            ParseErrorKind::UnexepctedEnd => write!(f, "unexpected end of input"),
+            ParseErrorKind::TrailingData => write!(f, "unexpected trailing data"),
             ParseErrorKind::InvalidPoint => {
                 write!(f, "unsupported point index")
             }
@@ -270,39 +330,44 @@ impl<Pt: Point> InplaceWithTemp<Cycles<Pt>, ()> for Parse<'_, Pt> {
             unsafe { (std::str::from_utf8_unchecked(digits), rest) }
         }
 
-        fn parse_point<Pt: Point>(bytes: &[u8]) -> Result<(Pt, &[u8]), ParseError> {
-            let (num, rest) = split_ascii_digits(bytes);
+        fn parse_point<Pt: Point>(bytes: &[u8], offset: usize) -> Result<(Pt, &[u8]), ParseError> {
+            let (point, rest) = split_ascii_digits(bytes);
 
-            if num.is_empty() {
-                return Err(ParseError {
-                    kind: ParseErrorKind::UnexpectedCharacter,
-                });
+            if point.is_empty() {
+                return Err(ParseError::unexpected(bytes));
             }
 
-            let num = Pt::from_str(num).map_err(|_| ParseError {
-                kind: ParseErrorKind::InvalidPoint,
-            })?;
-
-            if num.index() >= Pt::MAX_DEGREE {
-                return Err(ParseError {
+            let index = str::parse::<usize>(point)
+                .ok()
+                .and_then(|index| index.checked_sub(offset))
+                .filter(|&index| index < Pt::MAX_DEGREE)
+                .ok_or(ParseError {
                     kind: ParseErrorKind::InvalidPoint,
-                });
-            }
+                    bytes_left: bytes.len(),
+                })?;
 
-            Ok((num, skip_ascii_whitespace(rest)))
+            Ok((Pt::from_index(index), skip_ascii_whitespace(rest)))
         }
 
+        let offset: usize = match self.mode {
+            ParseMode::Gap => 1,
+            _ => 0,
+        };
+
         pending = skip_ascii_whitespace(pending);
+        let mut empty = true;
 
         'cycles: while let Some((b'(', rest)) = pending.split_first() {
             pending = skip_ascii_whitespace(rest);
 
-            if let Some((b')', rest)) = pending.split_first() {
-                pending = skip_ascii_whitespace(rest);
-                continue;
+            if take(&mut empty) {
+                if let Some((b')', rest)) = pending.split_first() {
+                    pending = skip_ascii_whitespace(rest);
+                    break;
+                }
             }
 
-            let (point, rest) = parse_point::<Pt>(pending)?;
+            let (point, rest) = parse_point::<Pt>(pending, offset)?;
             pending = rest;
             output.push_cycle([point]);
 
@@ -312,27 +377,44 @@ impl<Pt: Point> InplaceWithTemp<Cycles<Pt>, ()> for Parse<'_, Pt> {
                     continue 'cycles;
                 }
 
-                let (point, rest) = parse_point::<Pt>(pending)?;
+                if matches!(self.mode, ParseMode::Gap) {
+                    if let Some((b',', rest)) = pending.split_first() {
+                        pending = skip_ascii_whitespace(rest);
+                    } else {
+                        return Err(ParseError {
+                            kind: ParseErrorKind::UnexpectedCharacter,
+                            bytes_left: pending.len(),
+                        });
+                    }
+                }
+
+                let (point, rest) = parse_point::<Pt>(pending, offset)?;
                 pending = rest;
                 output.push_to_last_cycle(point);
             }
         }
 
-        if !pending.is_empty() {
-            return Err(ParseError {
-                kind: ParseErrorKind::UnexpectedCharacter,
-            });
+        if empty {
+            return Err(ParseError::unexpected(pending));
         }
 
-        if self.check {
+        if matches!(self.mode, ParseMode::Decomposition | ParseMode::Gap) {
             temp.clear();
             temp.resize(output.degree, false);
 
             if !output.is_decomposition(temp.as_mut_slice()) {
                 return Err(ParseError {
                     kind: ParseErrorKind::RepeatedPoint,
+                    bytes_left: pending.len(),
                 });
             }
+        }
+
+        if !pending.is_empty() {
+            return Err(ParseError {
+                kind: ParseErrorKind::TrailingData,
+                bytes_left: pending.len(),
+            });
         }
 
         Ok(())
@@ -513,9 +595,48 @@ impl<Pt: Point> fmt::Display for Cycles<Pt> {
     }
 }
 
+impl<Pt: Point> gap::FmtGap for Cycles<Pt> {
+    fn fmt_gap(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+        if self.is_empty() {
+            f.write_str("()")
+        } else {
+            for cycle in self {
+                let mut sep = '(';
+                for pt in cycle {
+                    f.write_char(sep)?;
+                    sep = ',';
+                    fmt::Display::fmt(&(pt.index() + 1), f)?;
+                }
+                f.write_char(')')?;
+            }
+            Ok(())
+        }
+    }
+}
+
+impl<Pt: Point> FromStr for Cycles<Pt> {
+    type Err = ParseError;
+
+    fn from_str(s: &str) -> Result<Self, Self::Err> {
+        Self::parse(s).try_build()
+    }
+}
+
+impl<Pt: Point> gap::FromGapStr for Cycles<Pt> {
+    type Err = ParseError;
+
+    fn from_gap_str(s: &str) -> Result<Self, Self::Err> {
+        Self::parse_gap(s).try_build()
+    }
+}
+
 #[cfg(test)]
 mod tests {
-    use crate::{inplace::AssignInplace, perm::ArrayPerm};
+    use crate::{
+        gap::Gap,
+        inplace::AssignInplace,
+        perm::{ArrayPerm, VecPerm},
+    };
 
     use super::*;
 
@@ -578,6 +699,73 @@ mod tests {
     }
 
     #[test]
+    fn parse_gap() {
+        let input =
+            "(1,17,15,21,24,11,13,19,25,4,18)(2,9,7,29,27,6,3,14)(8,22,26,16,30,20,28)(10,12,23)";
+        let images = [
+            16, 8, 13, 17, 4, 2, 28, 21, 6, 11, 12, 22, 18, 1, 20, 29, 14, 0, 24, 27, 23, 25, 9,
+            10, 3, 15, 5, 7, 26, 19,
+        ];
+        let parsed: VecPerm<u32> = Cycles::parse_gap(input).try_build().unwrap().build();
+
+        assert_eq!(parsed.as_slice(), images);
+
+        let parsed: VecPerm<u32> = Cycles::parse_gap("()").try_build().unwrap().build();
+
+        assert_eq!(parsed, Perm::<u32>::identity());
+    }
+
+    #[test]
+    fn parse_errors() {
+        macro_rules! case {
+            ($fn:ident, $input:expr, $kind:ident, $left:pat) => {{
+                let res = Cycles::<u8>::$fn($input).try_build();
+                assert!(
+                    matches!(
+                        res,
+                        Err(ParseError {
+                            kind: ParseErrorKind::$kind,
+                            bytes_left: $left,
+                        }),
+                    ),
+                    "{:?} does not match Err(ParseError {{ kind: {}, bytes_left: {} }})",
+                    res,
+                    stringify!($kind),
+                    stringify!($left),
+                );
+            }};
+        }
+
+        case!(parse, "", UnexepctedEnd, 0);
+        case!(parse, "  ", UnexepctedEnd, 0);
+        case!(parse, " (", UnexepctedEnd, 0);
+        case!(parse, " ( ", UnexepctedEnd, 0);
+        case!(parse, " ((", UnexpectedCharacter, 1);
+        case!(parse, " )", UnexpectedCharacter, 1);
+        case!(parse, " ) ", UnexpectedCharacter, 2);
+        case!(parse, " ()(", TrailingData, 1);
+        case!(parse, " () (", TrailingData, 1);
+        case!(parse, " () ( ", TrailingData, 2);
+        case!(parse, " (1 2) ( ", UnexepctedEnd, 0);
+        case!(parse, " (1 2) ) ", TrailingData, 2);
+        case!(parse, " (1 2) ()", UnexpectedCharacter, 1);
+        case!(parse, " (1 2) () ", UnexpectedCharacter, 2);
+        case!(parse, " 1 ", UnexpectedCharacter, 2);
+        case!(parse, " (1 2)(3 4) a", TrailingData, 1);
+        case!(parse, "(1,2)", UnexpectedCharacter, 3);
+
+        case!(parse, "(255 256)", InvalidPoint, 4);
+
+        case!(parse_gap, "(1 2)", UnexpectedCharacter, 2);
+        case!(parse_gap, "(1,,2)", UnexpectedCharacter, 3);
+        case!(parse_gap, "(1,0)", InvalidPoint, 2);
+        case!(parse_gap, "(256,0)", InvalidPoint, 2);
+
+        case!(parse_gap, "(1,1) x", RepeatedPoint, 1);
+        case!(parse_decomposition, "(1 2)(3 1) x", RepeatedPoint, 1);
+    }
+
+    #[test]
     fn roundtrip_decompose_parse() {
         type SmallPerm = ArrayPerm<u32, 7>;
         let mut c = Cycles::<u32>::default();
@@ -589,6 +777,24 @@ mod tests {
             c.assign(g.cycles().with_temp(&mut temp));
             let c_str = c.to_string();
             d.try_assign(Cycles::parse_decomposition(&c_str).with_temp(&mut temp))
+                .unwrap();
+            h.assign(&d);
+            assert_eq!(h, g);
+        }
+    }
+
+    #[test]
+    fn roundtrip_decompose_parse_gap() {
+        type SmallPerm = ArrayPerm<u32, 7>;
+        let mut c = Cycles::<u32>::default();
+        let mut d = Cycles::<u32>::default();
+        let mut temp = Default::default();
+        let mut h = SmallPerm::default();
+
+        for g in SmallPerm::all() {
+            c.assign(g.cycles().with_temp(&mut temp));
+            let c_str = Gap(&c).to_string();
+            d.try_assign(Cycles::parse_gap(&c_str).with_temp(&mut temp))
                 .unwrap();
             h.assign(&d);
             assert_eq!(h, g);

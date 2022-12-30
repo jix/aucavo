@@ -218,6 +218,7 @@ pub trait AssignInplace {
     fn assign<Choice>(&mut self, operation: impl Inplace<Self, Choice, Err = Infallible>) {
         operation.assign_to(self);
     }
+
     /// Assign the result of `operation` in-place, overwriting a previous value or returns an error.
     ///
     /// Delegates to [`Inplace::try_assign_to`], switching the order of `self` and `operation`.
