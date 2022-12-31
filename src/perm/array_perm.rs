@@ -13,7 +13,7 @@ use crate::{
     point::Point,
 };
 
-use super::{iter::AllArrayPerms, raw::MaybeUninitPerm};
+use super::{iter::AllArrayPerms, raw};
 
 use super::{Perm, StorePerm};
 
@@ -181,11 +181,14 @@ unsafe impl<Pt: Point, const N: usize> StorePerm for ArrayPerm<Pt, N> {
     unsafe fn prepare_new_uninit_with_degree(
         uninit: &mut Self::Uninit,
         degree: usize,
-    ) -> &mut MaybeUninitPerm<Self::Point>
+    ) -> *mut Self::Point
     where
         Self: Sized,
     {
-        MaybeUninitPerm::from_mut_array(uninit).pad_from_degree(degree)
+        let target = uninit.as_mut_ptr() as *mut Self::Point;
+        // SAFETY: initializes padding for excess points not written by the caller
+        unsafe { raw::write_identity_padding(target, degree, N) };
+        target
     }
 
     #[inline]
@@ -203,13 +206,14 @@ unsafe impl<Pt: Point, const N: usize> StorePerm for ArrayPerm<Pt, N> {
     }
 
     #[inline]
-    unsafe fn prepare_assign_with_degree(
-        &mut self,
-        degree: usize,
-    ) -> &mut super::raw::MaybeUninitPerm<Self::Point> {
+    unsafe fn prepare_assign_with_degree(&mut self, degree: usize) -> *mut Self::Point {
         assert!(N <= Pt::MAX_DEGREE);
         assert!(degree <= N);
-        MaybeUninitPerm::from_init_mut_array::<N>(&mut self.array).pad_from_degree(degree)
+
+        let target = self.array.as_mut_ptr();
+        // SAFETY: initializes padding for excess points not written by the caller
+        unsafe { raw::write_identity_padding(target, degree, N) };
+        target
     }
 
     #[inline]

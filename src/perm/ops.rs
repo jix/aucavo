@@ -9,7 +9,7 @@
 //! they can be constructed directly using `T::new(...)`, calling the corresponding method of
 //! [`Perm`] is usually the more ergonomic choice.
 
-use crate::{cycles, inplace::InplaceWithTemp};
+use crate::cycles;
 
 use super::*;
 
@@ -28,9 +28,9 @@ impl<'a, Pt: Point> Inv<'a, Pt> {
     }
 }
 
-// SAFETY: `write_to_slice(output)` completly overwrites `output` with a valid permutation when
-// passed a `degree()` length slice. Here we depend on `Perm` being a valid permutation to
-// ensure we overwrite every entry.
+// SAFETY: `write_into_mut_ptr(output)` completly overwrites `output` with a valid permutation of
+// length `degree()`. Here we depend on `Perm` being a valid permutation to ensure we overwrite
+// every entry.
 unsafe impl<Pt: Point> PermVal<Pt> for Inv<'_, Pt> {
     #[inline]
     fn degree(&self) -> usize {
@@ -38,8 +38,9 @@ unsafe impl<Pt: Point> PermVal<Pt> for Inv<'_, Pt> {
     }
 
     #[inline]
-    unsafe fn write_into(self, output: &mut MaybeUninitPerm<Pt>) {
-        raw::write_inverse_same_degree(output, self.0);
+    unsafe fn write_into_mut_ptr(self, target: *mut Pt) {
+        // SAFETY: writes a valid permutation of the correct length
+        unsafe { raw::write_inverse(target, self.0.as_ptr(), self.0.degree()) };
     }
 }
 
@@ -66,7 +67,7 @@ impl<'a, Pt: Point> Prod<'a, Pt> {
     }
 }
 
-// SAFETY: `write_to_slice(output)` completly overwrites `output` with a valid permutation when
+// SAFETY: `write_into_mut_ptr(output)` completly overwrites `output` with a valid permutation when
 // passed a `degree()` length slice.
 unsafe impl<Pt: Point> PermVal<Pt> for Prod<'_, Pt> {
     #[inline]
@@ -75,8 +76,38 @@ unsafe impl<Pt: Point> PermVal<Pt> for Prod<'_, Pt> {
     }
 
     #[inline]
-    unsafe fn write_into(self, output: &mut MaybeUninitPerm<Pt>) {
-        raw::write_product(output, self.left, self.right);
+    unsafe fn write_into_mut_ptr(self, target: *mut Pt) {
+        if self.left.degree() < self.degree {
+            // SAFETY: since `self.degree` is the maximum of `self.left.degree()` and
+            // `self.right.degree()`, in this case `self.right.degree()` is `self.degree` so only
+            // the left permutation needs to be extended to the same degree.
+            unsafe {
+                raw::write_product_extend_left(
+                    target,
+                    self.left.as_ptr(),
+                    self.left.degree(),
+                    self.right.as_ptr(),
+                    self.degree,
+                )
+            };
+        } else {
+            // NOTE: write_product_extend_right avoids inner loop bound checks required by
+            // write_product_extend_left so it is the preferred method when all degrees are the
+            // same.
+
+            // SAFETY: since `self.degree` is the maximum of `self.left.degree()` and
+            // `self.right.degree()`, in this case `self.left.degree()` is `self.degree` so only the
+            // right permutation potentially needs to be extended to the same degree.
+            unsafe {
+                raw::write_product_extend_right(
+                    target,
+                    self.left.as_ptr(),
+                    self.right.as_ptr(),
+                    self.right.degree(),
+                    self.degree,
+                )
+            };
+        }
     }
 }
 
@@ -98,7 +129,7 @@ impl<'a, Pt: Point> Pow<'a, Pt> {
     }
 }
 
-// SAFETY: `write_to_slice(output)` completly overwrites `output` with a valid permutation when
+// SAFETY: `write_into_mut_ptr(output)` completly overwrites `output` with a valid permutation when
 // passed a `degree()` length slice.
 unsafe impl<Pt: Point> PermVal<Pt> for Pow<'_, Pt> {
     #[inline]
@@ -107,27 +138,12 @@ unsafe impl<Pt: Point> PermVal<Pt> for Pow<'_, Pt> {
     }
 
     #[inline]
-    unsafe fn write_into(self, _output: &mut MaybeUninitPerm<Pt>) {
-        // unsafe { self.write_to_slice_with_temp(output, &mut Default::default()) }
-        todo!()
-    }
-}
-
-// SAFETY: `write_to_slice(output)` completly overwrites `output` with a valid permutation when
-// passed a `degree()` length slice.
-unsafe impl<Pt: Point> PermValWithTemp<Pt> for Pow<'_, Pt> {
-    type Temp = SmallPerm<Pt, 128>;
-
-    #[inline]
-    unsafe fn write_into_with_temp(
-        self,
-        _output: &mut MaybeUninitPerm<Pt>,
-        _temp: &mut Self::Temp,
-    ) {
-        if self.exp != 0 {
-            todo!()
+    unsafe fn write_into_mut_ptr(self, target: *mut Pt) {
+        let degree = self.degree();
+        // SAFETY: overwrites `target` with a valid permutation
+        unsafe {
+            raw::write_power(target, self.perm.as_ptr(), degree, &self.exp);
         }
-        todo!()
     }
 }
 
@@ -171,37 +187,41 @@ impl<T: StorePerm + ?Sized> Inplace<T, ParseInplace> for Parse<'_, T::Point> {
     where
         T: Sized,
     {
-        self.try_build_with_temp(&mut Default::default())
+        Ok(self.cycles.try_build()?.build())
     }
 
     #[inline]
     fn try_assign_to(self, output: &mut T) -> Result<(), Self::Err> {
-        self.try_assign_to_with_temp(output, &mut Default::default())
+        self.cycles.try_build()?.assign_to(output);
+        Ok(())
     }
 }
 
-impl<T: StorePerm + ?Sized> InplaceWithTemp<T, ParseInplace> for Parse<'_, T::Point> {
-    type Temp = (cycles::Cycles<T::Point>, SmallVec<[bool; 256]>);
+#[cfg(test)]
+mod tests {
+    use super::*;
 
-    #[inline]
-    fn try_build_with_temp(self, temp: &mut Self::Temp) -> Result<T, Self::Err>
-    where
-        T: Sized,
-    {
-        self.cycles
-            .try_assign_to_with_temp(&mut temp.0, &mut temp.1)?;
-        Ok(temp.0.build())
-    }
+    #[test]
+    fn exp() {
+        let g: VecPerm<u16> = Perm::parse_gap(
+            "(1,17,28,23,3,9,6,19,30,14)(2,27,15)(5,12,24,10,8,18,21,22,16,13,29,25,7,11,20)",
+        )
+        .try_build()
+        .unwrap();
 
-    #[inline]
-    fn try_assign_to_with_temp(
-        self,
-        output: &mut T,
-        temp: &mut Self::Temp,
-    ) -> Result<(), Self::Err> {
-        self.cycles
-            .try_assign_to_with_temp(&mut temp.0, &mut temp.1)?;
-        temp.0.assign_to(output);
-        Ok(())
+        let gfixed: VecPerm<u16> = g.pow(1073741827).build();
+
+        for n in -16..16 {
+            let gn: VecPerm<u16> = g.pow(n).build();
+            let m = n ^ 101;
+            let gm: VecPerm<u16> = g.pow(m).build();
+
+            let glarge: VecPerm<u16> = g.pow(1073741827 - n - m).build();
+
+            let a: VecPerm<u16> = gn.prod(&glarge).build();
+            let b: VecPerm<u16> = a.prod(&gm).build();
+
+            assert_eq!(b, gfixed);
+        }
     }
 }

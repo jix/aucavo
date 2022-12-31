@@ -9,15 +9,12 @@ use std::{
     str::FromStr,
 };
 
-use smallvec::SmallVec;
+use smallvec::{smallvec, SmallVec};
 
 use crate::{
     gap,
-    inplace::{Inplace, InplaceWithTemp},
-    perm::{
-        raw::{self, MaybeUninitPerm},
-        Perm, PermVal,
-    },
+    inplace::Inplace,
+    perm::{raw, Perm, PermVal},
     point::Point,
 };
 
@@ -276,33 +273,13 @@ impl<Pt: Point> Inplace<Cycles<Pt>, ()> for Parse<'_, Pt> {
     where
         Cycles<Pt>: Sized,
     {
-        self.try_build_with_temp(&mut Default::default())
+        let mut output: Cycles<Pt> = Default::default();
+        self.try_assign_to(&mut output)?;
+        Ok(output)
     }
 
     #[inline]
     fn try_assign_to(self, output: &mut Cycles<Pt>) -> Result<(), Self::Err> {
-        self.try_assign_to_with_temp(output, &mut Default::default())
-    }
-}
-
-impl<Pt: Point> InplaceWithTemp<Cycles<Pt>, ()> for Parse<'_, Pt> {
-    type Temp = SmallVec<[bool; 256]>; // TUNE
-
-    #[inline]
-    fn try_build_with_temp(self, temp: &mut Self::Temp) -> Result<Cycles<Pt>, Self::Err>
-    where
-        Cycles<Pt>: Sized,
-    {
-        let mut cycles = Cycles::default();
-        self.try_assign_to_with_temp(&mut cycles, temp)?;
-        Ok(cycles)
-    }
-
-    fn try_assign_to_with_temp(
-        self,
-        output: &mut Cycles<Pt>,
-        temp: &mut Self::Temp,
-    ) -> Result<(), Self::Err> {
         output.clear();
 
         let mut pending = self.bytes;
@@ -402,8 +379,7 @@ impl<Pt: Point> InplaceWithTemp<Cycles<Pt>, ()> for Parse<'_, Pt> {
         }
 
         if matches!(self.mode, ParseMode::Decomposition | ParseMode::Gap) {
-            temp.clear();
-            temp.resize(output.degree, false);
+            let mut temp: SmallVec<[bool; 256]> = smallvec![false; output.degree];
 
             if !output.is_decomposition(temp.as_mut_slice()) {
                 return Err(ParseError {
@@ -454,58 +430,38 @@ impl<Pt: Point> Inplace<Cycles<Pt>, ()> for CycleDecomposition<'_, Pt> {
 
     #[inline]
     fn try_assign_to(self, output: &mut Cycles<Pt>) -> Result<(), Self::Err> {
-        self.try_assign_to_with_temp(output, &mut Default::default())
-    }
-}
-
-impl<Pt: Point> InplaceWithTemp<Cycles<Pt>, ()> for CycleDecomposition<'_, Pt> {
-    type Temp = SmallVec<[bool; 256]>; // TUNE
-
-    #[inline]
-    fn try_build_with_temp(self, temp: &mut Self::Temp) -> Result<Cycles<Pt>, Self::Err>
-    where
-        Cycles<Pt>: Sized,
-    {
-        let mut cycles = Cycles::default();
-        self.assign_to_with_temp(&mut cycles, temp);
-        Ok(cycles)
-    }
-
-    fn try_assign_to_with_temp(
-        self,
-        output: &mut Cycles<Pt>,
-        temp: &mut Self::Temp,
-    ) -> Result<(), Self::Err> {
         output.clear();
         output.degree = self.0.degree();
         let perm = self.0.as_min_degree();
-        temp.clear();
-        temp.resize(perm.degree(), false);
-        output.push_decomposition(perm, temp);
+        let mut seen: SmallVec<[bool; 256]> = smallvec![false; perm.degree()]; // TUNE
+        output.push_decomposition(perm, &mut seen);
         Ok(())
     }
 }
 
-// SAFETY: `write_to_slice(output)` completly overwrites `output` with a valid permutation when
-// passed a `degree()` length slice.
+// SAFETY: `write_into_mut_ptr(output)` completly overwrites `output` with a valid permutation of
+// length `degree()`.
 unsafe impl<Pt: Point> PermVal<Pt> for &Cycles<Pt> {
     #[inline]
     fn degree(&self) -> usize {
         self.degree
     }
 
-    unsafe fn write_into(self, output: &mut MaybeUninitPerm<Pt>) {
-        let output = raw::write_identity(output);
+    unsafe fn write_into_mut_ptr(self, output: *mut Pt) {
+        // SAFETY: initialize with a correctly sized identity permutation
+        unsafe {
+            raw::write_identity(output, self.degree);
 
-        for cycle in self.iter().rev() {
-            let mut points = cycle.iter();
-            if let Some(mut last) = points.next() {
-                for p in points {
-                    output.left_mul_transp_by_index(p.index(), last.index());
-                    last = p;
+            for cycle in self.iter().rev() {
+                let mut points = cycle.iter();
+                if let Some(&(mut last)) = points.next() {
+                    for &p in points {
+                        raw::left_multiply_transposition(output, self.degree, p, last);
+                        last = p;
+                    }
                 }
             }
-        }
+        };
     }
 }
 
@@ -667,12 +623,11 @@ mod tests {
     fn roundtrip_decompose() {
         type SmallPerm = ArrayPerm<u32, 7>;
         let mut c = Cycles::<u32>::default();
-        let mut temp = Default::default();
         let mut h = SmallPerm::default();
         let mut g_inv = SmallPerm::default();
 
         for g in SmallPerm::all() {
-            c.assign(g.cycles().with_temp(&mut temp));
+            c.assign(g.cycles());
             for cycle in &c {
                 assert!(cycle.len() >= 2);
             }
@@ -768,14 +723,12 @@ mod tests {
         type SmallPerm = ArrayPerm<u32, 7>;
         let mut c = Cycles::<u32>::default();
         let mut d = Cycles::<u32>::default();
-        let mut temp = Default::default();
         let mut h = SmallPerm::default();
 
         for g in SmallPerm::all() {
-            c.assign(g.cycles().with_temp(&mut temp));
+            c.assign(g.cycles());
             let c_str = c.to_string();
-            d.try_assign(Cycles::parse_decomposition(&c_str).with_temp(&mut temp))
-                .unwrap();
+            d.try_assign(Cycles::parse_decomposition(&c_str)).unwrap();
             h.assign(&d);
             assert_eq!(h, g);
         }
@@ -786,14 +739,12 @@ mod tests {
         type SmallPerm = ArrayPerm<u32, 7>;
         let mut c = Cycles::<u32>::default();
         let mut d = Cycles::<u32>::default();
-        let mut temp = Default::default();
         let mut h = SmallPerm::default();
 
         for g in SmallPerm::all() {
-            c.assign(g.cycles().with_temp(&mut temp));
+            c.assign(g.cycles());
             let c_str = Gap(&c).to_string();
-            d.try_assign(Cycles::parse_gap(&c_str).with_temp(&mut temp))
-                .unwrap();
+            d.try_assign(Cycles::parse_gap(&c_str)).unwrap();
             h.assign(&d);
             assert_eq!(h, g);
         }

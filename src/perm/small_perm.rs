@@ -1,7 +1,6 @@
 use std::{
     borrow::Borrow,
     cmp, fmt, hash,
-    mem::MaybeUninit,
     ops::{Deref, DerefMut},
     str::FromStr,
 };
@@ -15,7 +14,7 @@ use crate::{
     point::Point,
 };
 
-use super::{raw::MaybeUninitPerm, Perm, StorePerm};
+use super::{Perm, StorePerm};
 
 /// Owned permutation backed by a [`SmallVec`].
 ///
@@ -160,20 +159,12 @@ unsafe impl<Pt: Point, const N: usize> StorePerm for SmallPerm<Pt, N> {
     #[inline]
     unsafe fn prepare_new_uninit_with_degree(
         uninit: &mut Self::Uninit,
-        degree: usize,
-    ) -> &mut MaybeUninitPerm<Self::Point>
+        _degree: usize,
+    ) -> *mut Self::Point
     where
         Self: Sized,
     {
-        // SAFETY: we used `with_capacity(degree)` above to allocate sufficient storage and
-        // `StorePerm` guarantees we get such a value in `uninit` and are called with matching
-        // `degree`. `StorePerm` also guarantees that `degree` does not exceed `Pt::MAX_DEGREE`.
-        unsafe {
-            MaybeUninitPerm::from_mut_slice_unchecked(std::slice::from_raw_parts_mut(
-                uninit.vec.as_mut_ptr() as *mut MaybeUninit<Pt>,
-                degree,
-            ))
-        }
+        uninit.vec.as_mut_ptr()
     }
 
     #[inline]
@@ -188,15 +179,10 @@ unsafe impl<Pt: Point, const N: usize> StorePerm for SmallPerm<Pt, N> {
     }
 
     #[inline]
-    unsafe fn prepare_assign_with_degree(
-        &mut self,
-        degree: usize,
-    ) -> &mut super::raw::MaybeUninitPerm<Self::Point> {
+    unsafe fn prepare_assign_with_degree(&mut self, degree: usize) -> *mut Self::Point {
         self.vec.clear();
         self.vec.reserve_exact(degree);
-        // SAFETY: after clearing and reserving storage, the requirements here are the same as for
-        // `prepare_new_uninit_with_degree`.
-        unsafe { Self::prepare_new_uninit_with_degree(self, degree) }
+        self.vec.as_mut_ptr()
     }
 
     #[inline]

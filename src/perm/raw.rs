@@ -1,270 +1,444 @@
-//! Low-level primitives that implement operations on permutations.
-use std::mem::MaybeUninit;
+//! Low-level unchecked primitive permutation operations.
 
-use super::Perm;
-use crate::point::Point;
+// NOTE: previously I tried using a MaybeUninit variant of Perm for the low-level operations and
+// while that could reduce the amount of unsafe code a tiny bit, it made dealing with multiple
+// permutations that are expected to have the same degree really awkward, as it was not clear at all
+// when you could trust the slice lengths to be the same and when you would have to perform runtime
+// checks for this. When using separate pointer and degree arguments, this is clearly documented by
+// sharing the degree arguments for multiple pointers. After refactoring the code in this style, I
+// noticed that I found it much easier to manually check that the unsafe code is correct, even
+// though a bit more of it was required overall.
 
-// SAFETY: Limit amount of code that can access fields with safety invariants
-mod field_safety {
-    use super::*;
+use smallvec::{smallvec, SmallVec};
 
-    /// A potentially uninitialized permutation.
-    ///
-    /// Used to initialize [`Perm`] values.
-    #[repr(transparent)]
-    pub struct MaybeUninitPerm<Pt: Point> {
-        // SAFETY: we may not provide any safe API that could write uninitialized data to
-        // `MaybeUninitPerm` slice as it may be pointing into data that needs to remain initialized.
-        slice: [MaybeUninit<Pt>],
-    }
+use crate::{bignum::Int, point::Point};
 
-    impl<Pt: Point> MaybeUninitPerm<Pt> {
-        /// Provides read-only access to the potentially uninitialzed points of this permutation.
-        ///
-        #[inline(always)]
-        pub fn as_slice(&self) -> &[MaybeUninit<Pt>] {
-            &self.slice
-        }
+mod unchecked_wrappers;
 
-        /// Provides mutable access to the potentially uninitialzed points of this permutation.
-        ///
-        /// # Safety
-        /// From the returned slice, callers may not read values they have not overwritten themselves
-        /// nor may they write any uninitialized values to it.
-        #[inline(always)]
-        pub unsafe fn as_mut_slice(&mut self) -> &mut [MaybeUninit<Pt>] {
-            &mut self.slice
-        }
-    }
-}
+use unchecked_wrappers::{Unchecked, UncheckedPerm, UninitUncheckedPerm};
 
-pub use field_safety::MaybeUninitPerm;
-
-impl<Pt: Point> MaybeUninitPerm<Pt> {
-    /// Returns the size of the set the permutation acts on.
-    ///
-    /// See also [`Perm::degree`].
-    #[inline]
-    pub fn degree(&self) -> usize {
-        self.as_slice().len()
-    }
-
-    /// Casts a mutable slice of uninitialized points to an uninitialized permutation.
-    #[inline]
-    pub fn from_mut_slice(slice: &mut [MaybeUninit<Pt>]) -> &mut Self {
-        assert!(slice.len() <= Pt::MAX_DEGREE);
-        // SAFETY: only requirement is the assert above
-        unsafe { Self::from_mut_slice_unchecked(slice) }
-    }
-
-    /// Casts a mutable slice of uninitialized points to an uninitialized permutation without
-    /// checking the degree.
-    ///
-    /// # Safety
-    /// The length of the passed slice may not exceed [`Pt::MAX_DEGREE`][`Point::MAX_DEGREE`].
-    #[inline]
-    pub unsafe fn from_mut_slice_unchecked(slice: &mut [MaybeUninit<Pt>]) -> &mut Self {
-        // SAFETY: constructing an unsized repr(transparent) value
-        unsafe { &mut *(slice as *mut [MaybeUninit<Pt>] as *mut Self) }
-    }
-
-    /// Casts a mutable slice of initialized points to an uninitialized permutation without
-    /// checking the degree.
-    ///
-    /// # Safety
-    /// The length of the passed slice may not exceed [`Pt::MAX_DEGREE`][`Point::MAX_DEGREE`].
-    #[inline]
-    pub unsafe fn from_init_mut_slice_unchecked(slice: &mut [Pt]) -> &mut Self {
-        // SAFETY: constructing an unsized repr(transparent) value, casting Pt to MaybeUninit<Pt>
-        // We never allow save code to overwrite with MaybeUninit<Pt>
-        unsafe { &mut *(slice as *mut [Pt] as *mut Self) }
-    }
-
-    /// Casts a mutable reference to an uninitialized array of points to an uninitialized
-    /// permutation.
-    #[inline]
-    pub fn from_mut_array<const N: usize>(array: &mut MaybeUninit<[Pt; N]>) -> &mut Self {
-        assert!(N <= Pt::MAX_DEGREE);
-        // SAFETY: only requirement is the assert above
-        unsafe {
-            Self::from_mut_slice_unchecked(
-                (*(array as *mut MaybeUninit<[Pt; N]> as *mut [MaybeUninit<Pt>; N])).as_mut_slice(),
-            )
-        }
-    }
-
-    /// Casts a mutable reference to an array of points to an uninitialized permutation.
-    #[inline]
-    pub fn from_init_mut_array<const N: usize>(array: &mut [Pt; N]) -> &mut Self {
-        assert!(N <= Pt::MAX_DEGREE);
-        // SAFETY: only requirement is the assert above
-        unsafe {
-            Self::from_mut_slice_unchecked(
-                (*(array as *mut [Pt; N] as *mut [MaybeUninit<Pt>; N])).as_mut_slice(),
-            )
-        }
-    }
-
-    /// Returns a write-only iterator over the potentially uninitialized points of this permutation.
-    #[inline]
-    pub fn iter_write(&mut self) -> IterWrite<Pt> {
-        // SAFETY: IterWrite is write-only
-        unsafe { IterWrite(self.as_mut_slice().iter_mut()) }
-    }
-
-    /// Initializes the point at a given index.
-    #[inline]
-    pub fn write_at_index(&mut self, index: usize, image: Pt) -> &mut Pt {
-        // SAFETY: write only
-        unsafe { self.as_mut_slice()[index].write(image) }
-    }
-
-    /// Initializes a given point.
-    #[inline]
-    pub fn write_at(&mut self, point: Pt, image: Pt) -> &mut Pt {
-        self.write_at_index(point.index(), image)
-    }
-
-    /// Returns the fully initialized permutation.
-    ///
-    /// # Safety
-    /// This value must have been initialized with a valid permutation before calling this.
-    #[inline]
-    pub unsafe fn assume_init_mut(&mut self) -> &mut Perm<Pt> {
-        // SAFETY: the requirements below are exactly the ones documented above
-        unsafe {
-            Perm::from_mut_slice_unchecked(std::slice::from_raw_parts_mut(
-                self.as_mut_slice().as_mut_ptr() as *mut Pt,
-                self.degree(),
-            ))
-        }
-    }
-
-    /// Returns a smaller degree [`MaybeUninitPerm`] after adding identitiy padding.
-    ///
-    /// This can be used to initialize a larger degree permutation with code that initializes a
-    /// smaller degree premutation.
-    #[inline]
-    pub fn pad_from_degree(&mut self, mut degree: usize) -> &mut MaybeUninitPerm<Pt> {
-        // SAFETY: we only write initialized data or wrap it again in an `MaybeUninitPerm`
-        let (smaller, identity_padding) = unsafe { self.as_mut_slice().split_at_mut(degree) };
-        for p in identity_padding.iter_mut() {
-            p.write(Pt::from_index(degree));
-            degree += 1;
-        }
-        // SAFETY: increasing the degree would panic the `split_at_mut` above, so this does not
-        // exceed `Pt::MAX_DEGREE`.
-        unsafe { Self::from_mut_slice_unchecked(smaller) }
-    }
-}
-
-
-/// A write-only iterator over the potentially uninitialized points of this permutation.
-pub struct IterWrite<'a, Pt: Point>(std::slice::IterMut<'a, MaybeUninit<Pt>>);
-
-/// Write-only reference to potentially uninitialized data.
-pub struct WriteOnly<'a, T>(&'a mut MaybeUninit<T>);
-
-impl<'a, T> WriteOnly<'a, T> {
-    /// Initializes potentitally uninitialized data.
-    ///
-    /// This overwrites existing data without dropping it.
-    #[inline]
-    pub fn write(&mut self, value: T) -> &mut T {
-        self.0.write(value)
-    }
-}
-
-impl<'a, Pt: Point> Iterator for IterWrite<'a, Pt> {
-    type Item = WriteOnly<'a, Pt>;
-
-    #[inline]
-    fn next(&mut self) -> Option<Self::Item> {
-        self.0.next().map(WriteOnly)
-    }
-
-    #[inline]
-    fn size_hint(&self) -> (usize, Option<usize>) {
-        self.0.size_hint()
-    }
-}
-
-impl<'a, Pt: Point> DoubleEndedIterator for IterWrite<'a, Pt> {
-    #[inline]
-    fn next_back(&mut self) -> Option<Self::Item> {
-        self.0.next_back().map(WriteOnly)
-    }
-}
-
-impl<'a, Pt: Point> ExactSizeIterator for IterWrite<'a, Pt> {
-    #[inline]
-    fn len(&self) -> usize {
-        self.0.len()
-    }
-}
-
-/// Writes the identity permutation to `output`.
-#[inline]
-pub fn write_identity<Pt: Point>(output: &mut MaybeUninitPerm<Pt>) -> &mut Perm<Pt> {
-    for (i, mut p) in output.iter_write().enumerate() {
-        p.write(Pt::from_index(i));
-    }
-
-    // SAFETY: wrote a valid identity permutation above
-    unsafe { output.assume_init_mut() }
-}
-
-/// Writes a copy of `perm` to `output`, panics if the degrees differ.
-#[inline]
-pub fn write_copy_same_degree<'a, Pt: Point>(
-    output: &'a mut MaybeUninitPerm<Pt>,
-    perm: &Perm<Pt>,
-) -> &'a mut Perm<Pt> {
-    // SAFETY: this panics when the length do not match, otherwise fully overwrites output with
-    // valid data
-    unsafe { output.as_mut_slice() }.copy_from_slice(
-        // SAFETY: safe cast of &[Pt] to &[MaybeUninit<Pt>]
-        unsafe { &*(perm.as_slice() as *const [Pt] as *const [MaybeUninit<Pt>]) },
-    );
-
-    // SAFETY: copied a valid permutation
-    unsafe { output.assume_init_mut() }
-}
-
-/// Writes the inverse of `perm` to `output`, panics if the degrees differ.
-#[inline]
-pub fn write_inverse_same_degree<'a, Pt: Point>(
-    output: &'a mut MaybeUninitPerm<Pt>,
-    perm: &Perm<Pt>,
-) -> &'a mut Perm<Pt> {
-    // SAFETY: does not panic when the degrees match
-    assert_eq!(output.degree(), perm.degree());
-
-    // SAFETY: this cannot panic
-    for (i, p) in perm.iter() {
-        output.write_at(p, i);
-    }
-
-    // SAFETY: fully initialized output using the inverse of perm
-    unsafe { output.assume_init_mut() }
-}
-
-/// Writes the product of `left` and `right` to `output`.
+/// Writes identitiy padding to extend a permutation from `small_degree` to `large_degree`.
 ///
-/// This panics if either input has a larger degree than `output`.
-pub fn write_product<'a, Pt: Point>(
-    output: &'a mut MaybeUninitPerm<Pt>,
-    left: &Perm<Pt>,
-    right: &Perm<Pt>,
-) -> &'a mut Perm<Pt> {
-    // SAFETY: does not panic when the output degree matches the max of left and right
-    assert!(left.degree().max(right.degree()) <= output.degree());
+/// # Safety
+/// When called, `target` must be a valid mutable pointer to at least `large_degree` elements. The
+/// values at
+/// the points `small_degree..large_degree` will be overwritten. It is safe to call this before
+/// initializing the points `0..small_degree`.
+#[inline]
+pub unsafe fn write_identity_padding<Pt: Point>(
+    target: *mut Pt,
+    small_degree: usize,
+    large_degree: usize,
+) {
+    // SAFETY: writes in the documented range
+    unsafe {
+        let target = UninitUncheckedPerm::from_mut_ptr(target, large_degree);
 
-    // SAFETY: this cannot panic
-    for (i, mut p) in output.iter_write().enumerate() {
-        p.write(right.image(left.image_of_index(i)));
+        for index in small_degree..large_degree {
+            target.write_index(index, index)
+        }
+    }
+}
+
+/// Writes an identity permutation.
+///
+/// # Safety
+/// When called, `target` must be a valid mutable pointer to `degree` elements which will be
+/// initialized with a valid permutation.
+#[inline]
+pub unsafe fn write_identity<Pt: Point>(target: *mut Pt, degree: usize) {
+    // SAFETY: writes a valid permutation of the required degree.
+    unsafe { write_identity_padding(target, 0, degree) }
+}
+
+/// Writes the inverse of a permutation.
+///
+/// # Safety
+/// When called, `target` must be a valid mutable pointer to `degree` elements which will be
+/// initialized with a valid permutation. The argument `perm` must point to a valid permutation of
+/// the same degree. The pointer arguments may not overlap.
+#[inline]
+pub unsafe fn write_inverse<Pt: Point>(target: *mut Pt, perm: *const Pt, degree: usize) {
+    // SAFETY: writes a valid permutation of the required degree if `perm` is a valid permutation of
+    // the same degree
+    unsafe {
+        let perm = UncheckedPerm::from_ptr(perm, degree);
+        let target = UncheckedPerm::from_mut_ptr(target, degree);
+
+        for index in 0..degree {
+            target.write_index(perm.read(index).index(), index);
+        }
+    }
+}
+
+/// Writes the product of two permutations of the same degree.
+///
+/// # Safety
+/// When called, `target` must be a valid mutable pointer to `degree` elements which will be
+/// initialized with a valid permutation. The arguments `left` and `right` must point to valid
+/// permutations of the same degree as `target`. The `target` pointer may not overlap with other
+/// arguments, while `left` and `right` are allowed to point to the same permutation.
+// SAFETY: callers within this module make further assumptions on `write_product` and need to be
+// manually checked before changing this implementation.
+#[inline]
+pub unsafe fn write_product<Pt: Point>(
+    target: *mut Pt,
+    left: *const Pt,
+    right: *const Pt,
+    degree: usize,
+) {
+    // SAFETY: writes a valid permutation of the required degree
+    unsafe {
+        let target = UninitUncheckedPerm::from_mut_ptr(target, degree);
+        let left = UncheckedPerm::from_ptr(left, degree);
+        let right = UncheckedPerm::from_ptr(right, degree);
+
+        for index in 0..degree {
+            let mid_index = left.read(index).index();
+            target.write(index, right.read(mid_index));
+        }
+    }
+}
+
+/// Right multiplies a permutation with another permutation of the same degree in place.
+///
+/// # Safety
+/// When called, `target_left` and `right` must be a valid pointers to permutations of degree
+/// `degree` and `target_left` will be completely overwritten by their product.
+#[inline]
+pub unsafe fn right_multiply<Pt: Point>(target_left: *mut Pt, right: *const Pt, degree: usize) {
+    // SAFETY: writes a valid permutation of the required degree
+    unsafe {
+        let target_left = UncheckedPerm::from_mut_ptr(target_left, degree);
+        let right = UncheckedPerm::from_ptr(right, degree);
+
+        for index in 0..degree {
+            let mid_index = target_left.read(index).index();
+            target_left.write(index, right.read(mid_index));
+        }
+    }
+}
+
+/// Writes the inverse of the product of two permutations of the same degree.
+///
+/// # Safety
+/// When called, `target` must be a valid mutable pointer to `degree` elements which will be
+/// initialized with a valid permutation. The arguments `left` and `right` must point to valid
+/// permutations of the same degree as `target`. The `target` pointer may not overlap with other
+/// arguments, while `left` and `right` are allowed to point to the same permutation.
+#[inline]
+pub unsafe fn write_inverse_product<Pt: Point>(
+    target: *mut Pt,
+    left: *const Pt,
+    right: *const Pt,
+    degree: usize,
+) {
+    // SAFETY: writes a valid permutation of the required degree
+    unsafe {
+        let target = UninitUncheckedPerm::from_mut_ptr(target, degree);
+        let left = UncheckedPerm::from_ptr(left, degree);
+        let right = UncheckedPerm::from_ptr(right, degree);
+
+        for index in 0..degree {
+            let mid_index = left.read(index).index();
+            target.write_index(right.read(mid_index).index(), index);
+        }
+    }
+}
+
+/// Writes the product of two permutations where the right factor may have a smaller degree.
+///
+/// # Safety
+/// When called, `target` must be a valid mutable pointer to `degree` elements which will be
+/// initialized with a valid permutation. The arguments `left` and `right` must point to valid
+/// permutations where `left` has the same degree as `target` and `right` has the same or smaller
+/// degree. The `target` pointer may not overlap with other arguments, while `left` and `right` are
+/// allowed to point to the same permutation.
+#[inline]
+pub unsafe fn write_product_extend_right<Pt: Point>(
+    target: *mut Pt,
+    left: *const Pt,
+    right: *const Pt,
+    right_degree: usize,
+    degree: usize,
+) {
+    debug_assert!(right_degree <= degree);
+    // SAFETY: writes a valid permutation of the required degree
+    unsafe {
+        let target = UninitUncheckedPerm::from_mut_ptr(target, degree);
+        let left = UncheckedPerm::from_ptr(left, degree);
+        let right = UncheckedPerm::from_ptr(right, right_degree);
+
+        for index in 0..degree {
+            let mid = left.read(index);
+            let mid_index = mid.index();
+            // SAFETY: requires a dynamic bounds check when accessing `right`
+            target.write(
+                index,
+                if mid_index < right_degree {
+                    right.read(mid_index)
+                } else {
+                    mid
+                },
+            );
+        }
+    }
+}
+
+/// Writes the product of two permutations where the left factor may have a smaller degree.
+///
+/// # Safety
+/// When called, `target` must be a valid mutable pointer to `degree` elements which will be
+/// initialized with a valid permutation. The arguments `left` and `right` must point to valid
+/// permutations where `right` has the same degree as `target` and `left` has the same or smaller
+/// degree. The `target` pointer may not overlap with other arguments, while `left` and `right` are
+/// allowed to point to the same permutation.
+#[inline]
+pub unsafe fn write_product_extend_left<Pt: Point>(
+    target: *mut Pt,
+    left: *const Pt,
+    left_degree: usize,
+    right: *const Pt,
+    degree: usize,
+) {
+    // SAFETY: writes a valid permutation of the required degree
+    unsafe {
+        // SAFETY: For the first `left_degree` points we can use `write_product` as the images in
+        // `left` used as indices for `right` cannot exceed `left_degree`. This does not stricyl
+        // fulfill the public contract of `write_product` but the implementation above contains a
+        // warning about this.
+        write_product(target, left, right, left_degree);
+
+        // SAFETY: for the remaining points the first applied `left` is the identity, so computing
+        // the product ends up being a copy of the remaining points in `right` after which we end up
+        // with a valid permutation.
+        target
+            .add(left_degree)
+            .copy_from_nonoverlapping(right.add(left_degree), degree - left_degree)
+    }
+}
+
+#[inline]
+unsafe fn write_small_positive_power<Pt: Point>(
+    target: *mut Pt,
+    perm: *const Pt,
+    degree: usize,
+    exp: usize,
+) {
+    // SAFETY: writes a valid permutation of the required degree
+    unsafe {
+        // SAFETY: either delegates
+        match exp {
+            0 => return write_identity(target, degree),
+            1 => return target.copy_from_nonoverlapping(perm, degree),
+            2 => return write_product(target, perm, perm, degree),
+            _ => (),
+        }
+
+        let target = UninitUncheckedPerm::from_mut_ptr(target, degree);
+        let perm = UncheckedPerm::from_ptr(perm, degree);
+
+        // SAFETY: or writes a complete permutation
+        for index in 0..degree {
+            let mut pt = perm.read(index);
+
+            for _ in 1..exp {
+                pt = perm.read(pt.index());
+            }
+
+            target.write(index, pt);
+        }
+    }
+}
+
+#[inline]
+unsafe fn write_small_negative_power<Pt: Point>(
+    target: *mut Pt,
+    perm: *const Pt,
+    degree: usize,
+    exp: usize,
+) {
+    // SAFETY: writes a valid permutation of the required degree
+    unsafe {
+        // SAFETY: either delegates
+        match exp {
+            0 => return write_identity(target, degree),
+            1 => return write_inverse(target, perm, degree),
+            2 => return write_inverse_product(target, perm, perm, degree),
+            _ => (),
+        }
+
+        let target = UninitUncheckedPerm::from_mut_ptr(target, degree);
+        let perm = UncheckedPerm::from_ptr(perm, degree);
+
+        // SAFETY: or writes a complete permutation
+        for index in 0..degree {
+            let mut pt = perm.read(index);
+
+            for _ in 1..exp {
+                pt = perm.read(pt.index());
+            }
+
+            target.write_index(pt.index(), index);
+        }
+    }
+}
+
+unsafe fn write_large_power<Pt: Point>(
+    target: *mut Pt,
+    perm: *const Pt,
+    degree: usize,
+    exp: &impl Int,
+) {
+    // SAFETY: writes a valid permutation of the required degree
+    unsafe {
+        let target = UninitUncheckedPerm::from_mut_ptr(target, degree);
+        let perm = UncheckedPerm::from_ptr(perm, degree);
+
+        let mut seen: SmallVec<[bool; 256]> = smallvec![false; degree]; // TUNE
+        let seen = Unchecked::from_mut_slice(&mut seen);
+
+        for index in 0..degree {
+            let pt = Pt::from_index(index);
+            let mut current = perm.read(index);
+            if current == pt {
+                // SAFETY: fixpoints remain fixed and are written here
+                target.write(index, pt);
+                continue;
+            } else if seen.read(index) {
+                // SAFETY: points that were already written have `seen` set
+                continue;
+            }
+
+            seen.write(index, true);
+            seen.write(current.index(), true);
+
+            let mut cycle_length = 2;
+
+            loop {
+                let next = perm.read(current.index());
+                if next == pt {
+                    break;
+                }
+                cycle_length += 1;
+                current = next;
+                seen.write(current.index(), true);
+            }
+
+            let shift = exp.mod_usize(cycle_length);
+
+            let mut from = current;
+            current = pt;
+
+            for _ in 0..shift {
+                from = perm.read(from.index());
+            }
+
+            for _ in 0..cycle_length {
+                target.write(current.index(), perm.read(from.index()));
+
+                from = perm.read(from.index());
+                current = perm.read(current.index());
+            }
+        }
+    }
+}
+
+/// Writes the power of a permutation.
+///
+/// # Safety
+/// When called, `target` must be a valid mutable pointer to `degree` elements which will be
+/// initialized with a valid permutation. The argument `perm` must point to a valid permutation of
+/// the same degree. The pointer arguments may not overlap.
+#[inline]
+pub unsafe fn write_power<Pt: Point>(
+    target: *mut Pt,
+    perm: *const Pt,
+    degree: usize,
+    exp: &impl Int,
+) {
+    const fn can_be_negative<T: Int>(_: &T) -> bool {
+        T::SIGNED
     }
 
-    // SAFETY: fully initialized with a valid permutation
-    unsafe { output.assume_init_mut() }
+    // SAFETY: delegates to one of the implementations
+    unsafe {
+        // TODO tune exponent cutoff
+        if let Some(abs_exp) = exp.unsigned_abs_as_usize().filter(|&abs| abs <= 8) {
+            if exp.is_negative() {
+                return write_small_negative_power(target, perm, degree, abs_exp);
+            } else {
+                return write_small_positive_power(target, perm, degree, abs_exp);
+            }
+        }
+
+        if can_be_negative(exp) {
+            if let Some(exp) = exp.as_isize() {
+                return write_large_power(target, perm, degree, &exp);
+            }
+        } else if let Some(exp) = exp.as_usize() {
+            return write_large_power(target, perm, degree, &exp);
+        }
+
+        write_large_power(target, perm, degree, exp);
+    }
+}
+
+/// Advances to the lexicographically next permutation in-place.
+///
+/// This steps lexicographically through permutations of the same degree. It returns `false` and
+/// resets to the identity permutation (lexicographically first) when called on the
+/// lexciographically last permutation.
+///
+/// # Safety
+/// When called, `target` must be a mutable pointer to a valid permutation of degree `degree` which
+/// is modified in-place.
+pub unsafe fn lexicographical_next<Pt: Point>(target: *mut Pt, degree: usize) -> bool {
+    // SAFETY: only does in-bounds swaps and reversals
+    unsafe {
+        if degree == 0 {
+            return false;
+        }
+
+        let target = UncheckedPerm::from_mut_ptr(target, degree);
+
+        let mut prev = target.read(degree - 1);
+
+        let Some(a) = (0..degree - 1).rev().find(|&index| {
+            let current = target.read(index);
+            let found = current < prev;
+            prev = current;
+            found
+        }) else {
+            write_identity(target.as_mut_ptr(), degree);
+            return false;
+        };
+
+        let a_image = target.read(a);
+
+        let b = a
+            + 1
+            + target
+                .get_mut(a + 2..degree)
+                .partition_point(|&b_image| b_image > a_image);
+
+        target.swap(a, b);
+        target.get_mut(a + 1..degree).reverse();
+
+        true
+    }
+}
+
+/// Left-multiplies a transposition of two points in-place.
+///
+/// # Safety
+/// When called, `target` must be a mutable pointer to a valid permutation of degree `degree` which
+/// is modified in-place.
+#[inline(always)]
+pub unsafe fn left_multiply_transposition<Pt: Point>(target: *mut Pt, degree: usize, a: Pt, b: Pt) {
+    // SAFETY: in-bounds swap
+    unsafe {
+        let target = UncheckedPerm::from_mut_ptr(target, degree);
+        target.swap(a.index(), b.index());
+    }
 }
