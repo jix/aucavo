@@ -728,7 +728,7 @@ mod tests {
 
     #[test]
     fn array_perm_all_order() {
-        let perms: Vec<_> = ArrayPerm::<u8, 7>::all().collect();
+        let perms: Vec<_> = ArrayPerm::<u8, 5>::all().collect();
 
         for pairs in perms.windows(2) {
             assert!(pairs[0] < pairs[1]);

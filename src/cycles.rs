@@ -594,6 +594,11 @@ mod tests {
 
     use super::*;
 
+    #[cfg(not(miri))]
+    type TinyPerm = ArrayPerm<u32, 7>;
+    #[cfg(miri)]
+    type TinyPerm = ArrayPerm<u32, 5>;
+
     #[test]
     #[allow(clippy::needless_borrow)]
     fn push_iter_display() {
@@ -621,12 +626,11 @@ mod tests {
 
     #[test]
     fn roundtrip_decompose() {
-        type SmallPerm = ArrayPerm<u32, 7>;
         let mut c = Cycles::<u32>::default();
-        let mut h = SmallPerm::default();
-        let mut g_inv = SmallPerm::default();
+        let mut h = TinyPerm::default();
+        let mut g_inv = TinyPerm::default();
 
-        for g in SmallPerm::all() {
+        for g in TinyPerm::all() {
             c.assign(g.cycles());
             for cycle in &c {
                 assert!(cycle.len() >= 2);
@@ -720,12 +724,11 @@ mod tests {
 
     #[test]
     fn roundtrip_decompose_parse() {
-        type SmallPerm = ArrayPerm<u32, 7>;
         let mut c = Cycles::<u32>::default();
         let mut d = Cycles::<u32>::default();
-        let mut h = SmallPerm::default();
+        let mut h = TinyPerm::default();
 
-        for g in SmallPerm::all() {
+        for g in TinyPerm::all() {
             c.assign(g.cycles());
             let c_str = c.to_string();
             d.try_assign(Cycles::parse_decomposition(&c_str)).unwrap();
@@ -736,12 +739,11 @@ mod tests {
 
     #[test]
     fn roundtrip_decompose_parse_gap() {
-        type SmallPerm = ArrayPerm<u32, 7>;
         let mut c = Cycles::<u32>::default();
         let mut d = Cycles::<u32>::default();
-        let mut h = SmallPerm::default();
+        let mut h = TinyPerm::default();
 
-        for g in SmallPerm::all() {
+        for g in TinyPerm::all() {
             c.assign(g.cycles());
             let c_str = Gap(&c).to_string();
             d.try_assign(Cycles::parse_gap(&c_str)).unwrap();
