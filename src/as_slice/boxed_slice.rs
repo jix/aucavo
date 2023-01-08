@@ -75,7 +75,10 @@ unsafe impl<T> DynSlice for Box<[T]> {
             boxed = unsafe { Box::<[MaybeUninit<T>]>::new_with(new_len, |_| ()) };
         }
 
-        init(&mut boxed)
+        init(&mut boxed);
+
+        // SAFETY: post is required to initialize all elements
+        unsafe { replace(self, boxed_assume_init(boxed)) };
     }
 }
 

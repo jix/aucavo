@@ -1,10 +1,10 @@
 macro_rules! specialize_trait {
     ($(#[$($attr:tt)*])* $name:ident: $($bound:tt)*) => {
         $(#[$($attr)*])*
-        pub trait $name<Target: ?Sized, Input, Output>: Sized {
-            fn base(self, input: Input) -> Output;
+        pub trait $name<Target: ?Sized, Output>: Sized {
+            fn base(self) -> Output;
 
-            fn specialized(self, input: Input) -> Output
+            fn specialized(self) -> Output
             where
                 Target: $($bound)*;
         }
@@ -15,11 +15,10 @@ macro_rules! specialize_dispatcher {
     ($(#[$($attr:tt)*])* $fnname:ident: $trait:ident) => {
         $(#[$($attr)*])*
         #[inline(always)]
-        fn $fnname<Input, Output, S: $trait<Self, Input, Output>>(
+        fn $fnname<Output, S: $trait<Self, Output>>(
             specialization: S,
-            input: Input,
         ) -> Output {
-            specialization.base(input)
+            specialization.base()
         }
     };
 }
@@ -28,11 +27,10 @@ macro_rules! specialize_impl {
     ($(#[$($attr:tt)*])* $fnname:ident: $trait:ident) => {
         $(#[$($attr)*])*
         #[inline(always)]
-        fn $fnname<Input, Output, S: $trait<Self, Input, Output>>(
+        fn $fnname<Output, S: $trait<Self, Output>>(
             specialization: S,
-            input: Input,
         ) -> Output  {
-            specialization.specialized(input)
+            specialization.specialized()
         }
     };
 }
@@ -44,32 +42,31 @@ macro_rules! specialize_forward {
     ) => {
         $(#[$($attr)*])*
         #[inline(always)]
-        fn $fnname<Input, Output, S: $trait<Self, Input, Output>>(
+        fn $fnname<Output, S: $trait<Self, Output>>(
             specialization: S,
-            input: Input,
         ) -> Output {
             #[repr(transparent)]
             struct Wrap<S>(S);
 
-            impl<$($lt,)* S, $target: $($tbound)*, Input, Output> $trait<$target, Input, Output> for Wrap<S>
+            impl<$($lt,)* S, $target: $($tbound)*, Output> $trait<$target, Output> for Wrap<S>
             where
-                S: $trait<$($typat)*, Input, Output>,
+                S: $trait<$($typat)*, Output>,
             {
                 #[inline(always)]
-                fn base(self, input: Input) -> Output {
-                    <S as $trait<$($typat)*, Input, Output>>::base(self.0, input)
+                fn base(self) -> Output {
+                    <S as $trait<$($typat)*, Output>>::base(self.0)
                 }
 
                 #[inline(always)]
-                fn specialized(self, input: Input) -> Output
+                fn specialized(self) -> Output
                 where
                     $target: $($bound)*,
                 {
-                    <S as $trait<$($typat)*, Input, Output>>::specialized(self.0, input)
+                    <S as $trait<$($typat)*, Output>>::specialized(self.0)
                 }
             }
 
-            T::$fnname::<Input, Output, Wrap<S>>(Wrap(specialization), input)
+            T::$fnname::<Output, Wrap<S>>(Wrap(specialization))
         }
     };
 }
