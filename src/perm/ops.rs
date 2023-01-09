@@ -34,17 +34,8 @@ unsafe impl<'a, Pt: Point> PermVal for Inverse<'a, Pt> {
 
     #[inline]
     unsafe fn write_to_uninitialized_unchecked(self, target: &mut [MaybeUninit<Self::Pt>]) {
-        let images = self.0.images();
-
-        for (index, image) in images.iter().enumerate() {
-            // SAFETY: writes distinct images for every point, access in range for valid
-            // permutations.
-            unsafe {
-                target
-                    .get_unchecked_mut(image.index())
-                    .write(Pt::from_index(index));
-            }
-        }
+        // SAFETY: target has requested degree, passed perm is a valid perm
+        unsafe { super::raw::write_inverse(target, self.0.images()) };
     }
 }
 
@@ -79,15 +70,14 @@ unsafe impl<'a, Pt: Point> PermVal for Product<'a, Pt> {
 
     #[inline]
     unsafe fn write_to_uninitialized_unchecked(self, target: &mut [MaybeUninit<Self::Pt>]) {
-        // TODO replace with better implementation
-        for index in 0..self.degree {
-            // SAFETY: writes distinct images for every point, caller has to provide `target` with
-            // len `self.degree`
-            unsafe {
-                target
-                    .get_unchecked_mut(index)
-                    .write(self.right.image(self.left.image_of_index(index)));
-            }
-        }
+        // SAFETY: target has requested degree, passed perms are valid and target has the same
+        // degree as the max degree among left and right (computed above in `new`)
+        unsafe {
+            super::raw::write_product_extend_smaller(
+                target,
+                self.left.images(),
+                self.right.images(),
+            )
+        };
     }
 }
