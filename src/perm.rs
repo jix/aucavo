@@ -248,10 +248,7 @@ impl<T: AsPointSlice + ?Sized> Perm<T> {
     /// Panics when `images` is not a valid permutation or when the length of `images` exceeds
     /// `T::Pt::MAX_DEGREE`.
     #[inline(always)]
-    pub fn from_images_ref(images: &T) -> Option<&Self>
-    where
-        T: Sized,
-    {
+    pub fn from_images_ref(images: &T) -> Option<&Self> {
         // SAFETY: `is_perm` checks the precondition for `from_images_unchecked`
         raw::is_perm(images.as_slice()).then(|| unsafe { Self::from_images_unchecked_ref(images) })
     }
@@ -262,10 +259,7 @@ impl<T: AsPointSlice + ?Sized> Perm<T> {
     /// Panics when `images` is not a valid permutation or when the length of `images` exceeds
     /// `T::Pt::MAX_DEGREE`.
     #[inline(always)]
-    pub fn from_images_mut(images: &mut T) -> Option<&mut Self>
-    where
-        T: Sized,
-    {
+    pub fn from_images_mut(images: &mut T) -> Option<&mut Self> {
         // SAFETY: `is_perm` checks the precondition for `from_images_unchecked`
         raw::is_perm(images.as_slice()).then(|| unsafe { Self::from_images_unchecked_mut(images) })
     }
