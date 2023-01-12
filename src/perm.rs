@@ -1,6 +1,7 @@
 //! Permutations.
 
 use std::{
+    cmp,
     mem::MaybeUninit,
     ops::{Deref, DerefMut, Range},
     str::FromStr,
@@ -164,6 +165,61 @@ impl<Pt: Point> Perm<[Pt]> {
 
         // SAFETY: we only remove fixed points, so shrunk stays a permutation
         unsafe { Perm::from_images_unchecked_ref(shrunk) }
+    }
+
+    #[inline]
+    fn eq_impl(&self, other: &Self) -> bool {
+        let mut lhs = self;
+        let mut rhs = other;
+
+        if lhs.degree() != rhs.degree() {
+            (lhs, rhs) = Self::eq_fixup(lhs, rhs);
+        }
+
+        lhs.images() == rhs.images()
+    }
+
+    #[cold] // TUNE
+    fn eq_fixup<'a>(mut lhs: &'a Self, mut rhs: &'a Self) -> (&'a Self, &'a Self) {
+        if lhs.degree() > rhs.degree() {
+            (lhs, rhs) = (rhs, lhs);
+        }
+        rhs = rhs.shrink_to_degree(lhs.degree());
+        (lhs, rhs)
+    }
+
+    #[inline]
+    fn cmp_impl(&self, other: &Self) -> cmp::Ordering {
+        let mut lhs = self;
+        let mut rhs = other;
+        let mut flip = false;
+
+        if lhs.degree() != rhs.degree() {
+            (lhs, rhs, flip) = Self::cmp_fixup(lhs, rhs);
+        }
+
+        let mut result = lhs.images().cmp(&rhs.images()[..lhs.degree()]);
+
+        if result.is_eq() && lhs.degree() != rhs.degree() {
+            result = cmp::Ordering::Less;
+        }
+
+        if flip {
+            result.reverse()
+        } else {
+            result
+        }
+    }
+
+    #[cold] // TUNE
+    fn cmp_fixup<'a>(mut lhs: &'a Self, mut rhs: &'a Self) -> (&'a Self, &'a Self, bool) {
+        let mut flip = false;
+        if lhs.degree() > rhs.degree() {
+            (lhs, rhs) = (rhs, lhs);
+            flip = true;
+        }
+        rhs = rhs.shrink_to_degree(lhs.degree());
+        (lhs, rhs, flip)
     }
 
     #[inline(never)]
@@ -522,6 +578,69 @@ impl<T: AsPointSlice + AsMutSlice> DerefMut for Perm<T> {
     #[inline(always)]
     fn deref_mut(&mut self) -> &mut Self::Target {
         self.as_mut()
+    }
+}
+
+impl<T: AsPointSlice + ?Sized, U: AsPointSlice<Pt = T::Pt> + ?Sized> PartialEq<Perm<U>>
+    for Perm<T>
+{
+    #[inline(always)]
+    fn eq(&self, other: &Perm<U>) -> bool {
+        self.as_ref().eq_impl(other.as_ref())
+    }
+}
+
+impl<T: AsPointSlice + ?Sized, U: AsPointSlice<Pt = T::Pt> + ?Sized> PartialEq<Perm<U>>
+    for &Perm<T>
+{
+    #[inline(always)]
+    fn eq(&self, other: &Perm<U>) -> bool {
+        self.as_ref().eq_impl(other.as_ref())
+    }
+}
+
+impl<T: AsPointSlice + ?Sized, U: AsPointSlice<Pt = T::Pt> + ?Sized> PartialEq<&Perm<U>>
+    for Perm<T>
+{
+    #[inline(always)]
+    fn eq(&self, other: &&Perm<U>) -> bool {
+        self.as_ref().eq_impl(other.as_ref())
+    }
+}
+
+impl<T: AsPointSlice + ?Sized> Eq for Perm<T> {}
+
+impl<T: AsPointSlice + ?Sized, U: AsPointSlice<Pt = T::Pt> + ?Sized> PartialOrd<Perm<U>>
+    for Perm<T>
+{
+    #[inline(always)]
+    fn partial_cmp(&self, other: &Perm<U>) -> Option<cmp::Ordering> {
+        Some(self.as_ref().cmp_impl(other.as_ref()))
+    }
+}
+
+impl<T: AsPointSlice + ?Sized, U: AsPointSlice<Pt = T::Pt> + ?Sized> PartialOrd<Perm<U>>
+    for &Perm<T>
+{
+    #[inline(always)]
+    fn partial_cmp(&self, other: &Perm<U>) -> Option<cmp::Ordering> {
+        Some(self.as_ref().cmp_impl(other.as_ref()))
+    }
+}
+
+impl<T: AsPointSlice + ?Sized, U: AsPointSlice<Pt = T::Pt> + ?Sized> PartialOrd<&Perm<U>>
+    for Perm<T>
+{
+    #[inline(always)]
+    fn partial_cmp(&self, other: &&Perm<U>) -> Option<cmp::Ordering> {
+        Some(self.as_ref().cmp_impl(other.as_ref()))
+    }
+}
+
+impl<T: AsPointSlice + ?Sized> Ord for Perm<T> {
+    #[inline(always)]
+    fn cmp(&self, other: &Self) -> cmp::Ordering {
+        self.as_ref().cmp_impl(other.as_ref())
     }
 }
 
