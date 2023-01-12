@@ -15,3 +15,4 @@ pub mod as_slice;
 pub mod bignum;
 pub mod perm;
 pub mod point;
+pub mod rand;

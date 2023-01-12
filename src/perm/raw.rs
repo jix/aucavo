@@ -16,6 +16,16 @@ pub unsafe fn write_identity_padding<Pt: Point>(
     }
 }
 
+#[inline(always)]
+pub fn write_identity<Pt: Point>(target: &mut [MaybeUninit<Pt>]) -> &mut [Pt] {
+    // SAFETY: a `from_degree` value of 0 is always in bounds
+    unsafe { write_identity_padding(target, 0) };
+
+    // FUTURE: use std method for this cast
+    // SAFETY: slice is fully initialized now
+    unsafe { &mut *(target as *mut [MaybeUninit<Pt>] as *mut [Pt]) }
+}
+
 /// Writes the inverse of `perm` to `target`
 ///
 /// # Safety
